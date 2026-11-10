@@ -241,6 +241,20 @@ async function processIncident(incident: IncidentRow, settings: Settings): Promi
   const id = incident.INCIDENT_ID
   const lease = setInterval(() => void renewLease(id, settings.leaseSeconds).catch(() => {}), 60_000)
   try {
+    // A previous process may have died mid-run (restart, redeploy): close out
+    // whatever it left RUNNING so the trace shows it as interrupted.
+    await sql(
+      `UPDATE ADE_DB.OPS.AGENT_STEPS SET STATUS = 'FAILED', ENDED_AT = SYSDATE(), DURATION_MS = DATEDIFF(millisecond, STARTED_AT, SYSDATE()),
+         ERROR_MESSAGE = 'Interrupted: the app restarted while this step was running'
+       WHERE INCIDENT_ID = ? AND STATUS = 'RUNNING'`,
+      [id],
+    )
+    await sql(
+      `UPDATE ADE_DB.OPS.AGENT_RUNS SET STATUS = 'FAILED', ENDED_AT = SYSDATE(), DURATION_MS = DATEDIFF(millisecond, STARTED_AT, SYSDATE()),
+         ERROR_MESSAGE = 'Interrupted: the app restarted during this run'
+       WHERE INCIDENT_ID = ? AND STATUS = 'RUNNING'`,
+      [id],
+    )
     publish({ type: "incident.updated", incidentId: id, status: "INVESTIGATING", at: nowIso() })
     await audit(id, null, "CLAIMED", { instance: INSTANCE, attempt: incident.ATTEMPTS + 1, resumed_from: incident.STATUS })
 
