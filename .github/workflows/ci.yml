@@ -1,0 +1,39 @@
+# Pull-request checks for ADE Mission Control: typecheck, unit tests and a
+# production build. Needs no Snowflake access (unit tests cover pure logic and
+# the SQL guard). Runs on pull requests and is reused by deploy.yml as the gate
+# before deploying.
+name: CI
+
+on:
+  pull_request:
+    paths:
+      - "mission-control/**"
+      - ".github/workflows/ci.yml"
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mission-control
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          # @snowflake/cortex-agent-sdk requires Node >= 22.22
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: mission-control/package-lock.json
+
+      - run: npm ci --include=dev
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build

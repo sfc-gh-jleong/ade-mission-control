@@ -1,0 +1,98 @@
+/* =====================================================================
+   07 — Credit reconciliation: CORTEX_AGENT_USAGE_HISTORY -> agent runs
+   ---------------------------------------------------------------------
+   Live telemetry records tokens per turn as the agent streams. Billed
+   credits appear later (up to ~1 h) in
+   SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY, one row per Cortex
+   request, with AGENT_NAME (ADE_INVESTIGATOR/FIXER/REVIEWER) and THREAD_ID.
+
+   The view's REQUEST_ID is the run kickoff's id, not the id the app sees
+   on the result stream, so requests are matched to agent runs by thread
+   and time: a request belongs to the run on the same thread whose
+   [STARTED_AT - 5 s, ENDED_AT + 2 min] window contains it.
+
+   ADE_DB.CORE.RECONCILE_USAGE() runs every 20 minutes (serverless task):
+     1. copies new ADE requests into TELEMETRY.AGENT_USAGE (last 2 days);
+     2. matches them to OPS.AGENT_RUNS;
+     3. sets AGENT_RUNS.CREDITS, distributes each run's credits over its
+        TURN steps by token share, and rolls up INCIDENTS.TOTAL_CREDITS.
+
+   Run:  snow sql -f sql/07_usage_reconcile.sql -c osm_deploy
+   ===================================================================== */
+USE ROLE ADE_OWNER_ROLE;
+USE WAREHOUSE ADE_WH;
+USE SECONDARY ROLES NONE;
+
+CREATE OR REPLACE PROCEDURE ADE_DB.CORE.RECONCILE_USAGE()
+RETURNS VARIANT
+LANGUAGE SQL
+COMMENT = 'Copy billed agent credits from ACCOUNT_USAGE and attribute them to ADE agent runs and steps'
+EXECUTE AS OWNER
+AS
+$$
+DECLARE
+  copied INTEGER DEFAULT 0;
+  matched INTEGER DEFAULT 0;
+  runs_updated INTEGER DEFAULT 0;
+BEGIN
+  INSERT INTO ADE_DB.TELEMETRY.AGENT_USAGE (REQUEST_ID, THREAD_ID, AGENT_NAME, START_TIME, END_TIME, TOKENS, TOKEN_CREDITS, TOKENS_GRANULAR, CREDITS_GRANULAR)
+  SELECT u.REQUEST_ID, TO_VARCHAR(u.THREAD_ID), u.AGENT_NAME,
+         CONVERT_TIMEZONE('UTC', u.START_TIME)::TIMESTAMP_NTZ, CONVERT_TIMEZONE('UTC', u.END_TIME)::TIMESTAMP_NTZ,
+         u.TOKENS, u.TOKEN_CREDITS, u.TOKENS_GRANULAR, u.CREDITS_GRANULAR
+  FROM SNOWFLAKE.ACCOUNT_USAGE.CORTEX_AGENT_USAGE_HISTORY u
+  WHERE u.START_TIME > DATEADD(day, -2, CURRENT_TIMESTAMP())
+    AND u.AGENT_DATABASE_NAME = 'ADE_DB' AND u.AGENT_SCHEMA_NAME = 'AGENTS'
+    AND NOT EXISTS (SELECT 1 FROM ADE_DB.TELEMETRY.AGENT_USAGE a WHERE a.REQUEST_ID = u.REQUEST_ID);
+  copied := SQLROWCOUNT;
+
+  UPDATE ADE_DB.TELEMETRY.AGENT_USAGE a
+    SET AGENT_RUN_ID = m.AGENT_RUN_ID
+    FROM (
+      SELECT a2.REQUEST_ID, r.AGENT_RUN_ID
+      FROM ADE_DB.TELEMETRY.AGENT_USAGE a2
+      JOIN ADE_DB.OPS.AGENT_RUNS r
+        ON r.THREAD_ID = a2.THREAD_ID
+       AND a2.START_TIME BETWEEN DATEADD(second, -5, r.STARTED_AT) AND DATEADD(minute, 2, COALESCE(r.ENDED_AT, SYSDATE()))
+      WHERE a2.AGENT_RUN_ID IS NULL
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY a2.REQUEST_ID ORDER BY r.STARTED_AT DESC) = 1
+    ) m
+    WHERE a.REQUEST_ID = m.REQUEST_ID;
+  matched := SQLROWCOUNT;
+
+  UPDATE ADE_DB.OPS.AGENT_RUNS r
+    SET CREDITS = c.CREDITS
+    FROM (SELECT AGENT_RUN_ID, SUM(TOKEN_CREDITS) AS CREDITS FROM ADE_DB.TELEMETRY.AGENT_USAGE WHERE AGENT_RUN_ID IS NOT NULL GROUP BY 1) c
+    WHERE r.AGENT_RUN_ID = c.AGENT_RUN_ID AND r.CREDITS IS DISTINCT FROM c.CREDITS;
+  runs_updated := SQLROWCOUNT;
+
+  -- Spread each run's credits over its TURN steps by token share.
+  UPDATE ADE_DB.OPS.AGENT_STEPS s
+    SET CREDITS = x.STEP_CREDITS
+    FROM (
+      SELECT st.STEP_ID,
+             r.CREDITS * (st.INPUT_TOKENS + st.OUTPUT_TOKENS) / NULLIF(SUM(st.INPUT_TOKENS + st.OUTPUT_TOKENS) OVER (PARTITION BY st.AGENT_RUN_ID), 0) AS STEP_CREDITS
+      FROM ADE_DB.OPS.AGENT_STEPS st
+      JOIN ADE_DB.OPS.AGENT_RUNS r ON r.AGENT_RUN_ID = st.AGENT_RUN_ID
+      WHERE st.KIND = 'TURN' AND r.CREDITS IS NOT NULL
+    ) x
+    WHERE s.STEP_ID = x.STEP_ID AND s.CREDITS IS DISTINCT FROM x.STEP_CREDITS;
+
+  UPDATE ADE_DB.OPS.INCIDENTS i
+    SET TOTAL_CREDITS = c.CREDITS
+    FROM (SELECT INCIDENT_ID, SUM(CREDITS) AS CREDITS FROM ADE_DB.OPS.AGENT_RUNS WHERE CREDITS IS NOT NULL GROUP BY 1) c
+    WHERE i.INCIDENT_ID = c.INCIDENT_ID AND i.TOTAL_CREDITS IS DISTINCT FROM c.CREDITS;
+
+  RETURN OBJECT_CONSTRUCT('copied', copied, 'matched', matched, 'runs_updated', runs_updated);
+END;
+$$;
+
+CREATE TASK IF NOT EXISTS ADE_DB.CORE.RECONCILE_USAGE_TASK
+  SCHEDULE = '20 MINUTE'
+  USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'
+  USER_TASK_TIMEOUT_MS = 300000
+  COMMENT = 'Attribute billed Cortex Agent credits to ADE agent runs'
+AS
+  CALL ADE_DB.CORE.RECONCILE_USAGE();
+
+ALTER TASK ADE_DB.CORE.RECONCILE_USAGE_TASK RESUME;
+GRANT MONITOR ON TASK ADE_DB.CORE.RECONCILE_USAGE_TASK TO ROLE ADE_APP_ROLE;

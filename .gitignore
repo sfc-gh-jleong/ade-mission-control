@@ -1,0 +1,11 @@
+node_modules/
+.next/
+out/
+output/
+coverage/
+*.tsbuildinfo
+.env*
+!.env.example
+snowflake.log
+.DS_Store
+next-env.d.ts

@@ -1,0 +1,53 @@
+version: 2
+
+name: ADE_MISSION_CONTROL
+database: ADE_DB
+schema: APP
+query_warehouse: ADE_WH
+build_eai: GHA_APP_NPM_EAI
+
+label: "ADE Mission Control"
+description: "Autonomous data-engineer agents (Investigator, Fixer, Reviewer) that diagnose failed Snowflake jobs, propose rehearsed fixes with a confidence score, and record every step's time, tokens and model."
+icon: public/icon.svg
+
+# The orchestrator runs inside this service and must keep working when nobody has
+# the UI open, so the service never auto-suspends. One instance: the in-process
+# event bus and incident leases assume a single orchestrator.
+auto_suspend_secs: 0
+min_instances: 1
+max_instances: 1
+
+# HMAC key that seals fixes and reviews. Mounted into this container only;
+# the agents' managed sandbox cannot read it (see lib/server/seal.ts).
+secrets:
+  - name: SEAL_KEY
+    secret: ADE_DB.SECRETS.SEAL_KEY
+
+ignore:
+  - node_modules
+  - .env*
+  - __pycache__
+  - "*.pyc"
+  - .next
+  - .git
+  - snowflake.log
+  - coverage
+  - output
+  - "*.tsbuildinfo"
+  - scripts/spikes
+
+install:
+  commands:
+    - ["npm", "ci", "--include=dev"]
+
+build:
+  commands:
+    - ["npm", "run", "build"]
+    # For standalone mode
+    - ["cp", "-r", ".next/static", ".next/standalone/.next/static"]
+    - ["cp", "-r", "public", ".next/standalone/public"]
+    # Avoid packaging extra node_modules since standalone includes its own
+    - ["rm", "-rf", "node_modules"]
+
+run:
+  command: ["node", ".next/standalone/server.js"]

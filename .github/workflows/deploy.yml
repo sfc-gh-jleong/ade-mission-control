@@ -1,0 +1,69 @@
+# Deploys ADE Mission Control to Snowflake App Runtime on every push to main
+# that touches the app. Auth is GitHub OIDC -> Snowflake workload identity
+# (service user GHA_ADE_APP_SVC); no secrets are stored in GitHub.
+# The deploy job targets the `prod` environment, so the OIDC subject is
+# repo:sfc-gh-jleong@204736462/ade-mission-control@1453213786:environment:prod
+# (immutable subject format; see sql/08_cicd_service_user.sql).
+name: Deploy ADE Mission Control
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "mission-control/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-ade-mission-control
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SNOWFLAKE_ACCOUNT: SFSENORTHAMERICA-JLEONG_AWS1
+  SNOWFLAKE_USER: GHA_ADE_APP_SVC
+  # The app's execution role: the deploying role must own the application service.
+  SNOWFLAKE_ROLE: ADE_APP_ROLE
+  SNOWFLAKE_WAREHOUSE: ADE_WH
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: mission-control
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Snowflake CLI
+        uses: snowflakedb/snowflake-actions@v3
+        with:
+          use-oidc: true
+
+      - name: Test connection
+        run: snow connection test -x
+
+      - name: Validate manifest
+        run: snow app validate -x
+
+      - name: Deploy
+        run: snow app deploy -x --verbose
+
+      - name: Publish app URL
+        run: |
+          url="$(snow app open --print-only -x | tail -n 1)"
+          echo "Deployed: $url"
+          echo "### ADE Mission Control deployed" >> "$GITHUB_STEP_SUMMARY"
+          echo "$url" >> "$GITHUB_STEP_SUMMARY"
