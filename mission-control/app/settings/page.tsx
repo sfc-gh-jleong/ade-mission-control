@@ -2,7 +2,7 @@
 
 import { useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
-import { Bot, Check, Database, Loader2, Power, Settings2, ShieldCheck, Users } from "lucide-react"
+import { Bot, Check, Database, GitPullRequest, Loader2, Power, Settings2, ShieldCheck, Users } from "lucide-react"
 import { api, ago, clock } from "@/lib/client"
 import { cn } from "@/lib/utils"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -15,7 +15,8 @@ import { CodeBlock } from "@/components/ade/code"
 interface SettingsData {
   settings: { key: string; value: unknown; description: string; updatedBy: string; updatedAt: string; editable: boolean }[]
   approvers: { user: string; active: boolean; addedBy: string; addedAt: string }[]
-  managedDatabases: { database: string; active: boolean }[]
+  managedDatabases: { database: string; active: boolean; delivery: string; repo: string | null }[]
+  repoObjects: { database: string; object: string; type: string; path: string; mayEdit: boolean }[]
   agents: { name: string; owner: string; createdOn: string; comment: string }[]
 }
 
@@ -28,13 +29,15 @@ const GROUPS = [
   { title: "Budgets", prefix: "budget." },
   { title: "Approval", prefix: "apply." },
   { title: "Models", prefix: "models." },
+  { title: "Git delivery", prefix: "delivery.github." },
 ]
 
 function SettingRow({ s, onSave, saving }: { s: SettingsData["settings"][number]; onSave: (v: unknown) => void; saving: boolean }) {
-  const [draft, setDraft] = useState(String(typeof s.value === "string" ? s.value : JSON.stringify(s.value)))
+  const shown = s.value === null ? "" : String(typeof s.value === "string" ? s.value : JSON.stringify(s.value))
+  const [draft, setDraft] = useState(shown)
   const isBool = typeof s.value === "boolean"
   const isNum = typeof s.value === "number"
-  const dirty = draft !== String(typeof s.value === "string" ? s.value : JSON.stringify(s.value))
+  const dirty = draft !== shown
   return (
     <div className="flex flex-wrap items-center gap-3 py-2.5">
       <div className="min-w-0 flex-1">
@@ -55,7 +58,7 @@ function SettingRow({ s, onSave, saving }: { s: SettingsData["settings"][number]
         </button>
       ) : s.editable ? (
         <div className="flex items-center gap-2">
-          <input value={draft} onChange={(e) => setDraft(e.target.value)} className="h-8 w-44 rounded-md border bg-card px-2 font-mono text-xs outline-none ring-primary/40 focus:ring-2" />
+          <input value={draft} placeholder="not set" onChange={(e) => setDraft(e.target.value)} className="h-8 w-44 rounded-md border bg-card px-2 font-mono text-xs outline-none ring-primary/40 focus:ring-2" />
           <Button size="sm" variant="outline" disabled={!dirty || saving} onClick={() => onSave(isNum ? Number(draft) : draft)}>
             {saving ? <Loader2 className="size-3.5 animate-spin" /> : <Check className="size-3.5" />}
           </Button>
@@ -88,6 +91,13 @@ export default function SettingsPage() {
     },
   })
   const enabled = data?.settings.find((s) => s.key === "pipeline.enabled")?.value !== false
+  const [check, setCheck] = useState<{ ok: boolean; results: { repo: string; ok: boolean; detail: string }[] } | null>(null)
+  const runCheck = useMutation({
+    mutationFn: () => api<{ ok: boolean; results: { repo: string; ok: boolean; detail: string }[] }>("/api/settings/github", { method: "POST" }),
+    onSuccess: (r) => setCheck(r),
+    onError: (e) => setCheck({ ok: false, results: [{ repo: "", ok: false, detail: (e as Error).message }] }),
+  })
+  const gitDbs = (data?.managedDatabases ?? []).filter((m) => m.delivery === "PULL_REQUEST")
 
   return (
     <main className="mx-auto w-full max-w-[1200px] space-y-5 px-4 py-6 sm:px-6 lg:px-8">
@@ -165,13 +175,48 @@ export default function SettingsPage() {
                 {data!.managedDatabases.map((m) => (
                   <div key={m.database} className="flex items-center justify-between">
                     <span className="font-mono">{m.database}</span>
-                    <span className={m.active ? "text-success" : "text-muted-foreground"}>{m.active ? "fixes allowed" : "monitor only"}</span>
+                    <span className={m.active ? "text-success" : "text-muted-foreground"}>
+                      {m.delivery === "PULL_REQUEST" ? "pull requests" : m.active ? "fixes allowed" : "monitor only"}
+                    </span>
                   </div>
                 ))}
                 <div className="pt-1 text-[11px] text-muted-foreground">Add a database (run by an admin):</div>
                 <CodeBlock lang="bash" code={`snow sql -f sql/03_scope_grants.sql -D "db=MY_DB" -c <connection>`} />
               </CardContent>
             </Card>
+            {gitDbs.length > 0 && (
+              <Card>
+                <CardHeader className="pb-2"><CardTitle className="flex items-center gap-2"><GitPullRequest className="size-4 text-primary" /> Managed in Git</CardTitle></CardHeader>
+                <CardContent className="space-y-2.5 text-xs">
+                  {gitDbs.map((m) => (
+                    <div key={m.database} className="space-y-1">
+                      <div className="flex items-center justify-between">
+                        <span className="font-mono">{m.database}</span>
+                        <span className="font-mono text-muted-foreground">{m.repo}</span>
+                      </div>
+                      {data!.repoObjects.filter((o) => o.database === m.database).map((o) => (
+                        <div key={o.path} className="flex items-center justify-between gap-2 pl-2 text-[11px]">
+                          <span className="truncate font-mono text-muted-foreground" title={o.object}>{o.path}</span>
+                          <span className={o.mayEdit ? "text-success" : "text-muted-foreground"}>{o.mayEdit ? "ADE may edit" : "deploy only"}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                  <p className="text-[11px] text-muted-foreground">
+                    Fixes to these databases arrive as pull requests; GUARD refuses direct changes. Mapping maintained by SYSADMIN in ADE_DB.GUARD.REPO_OBJECTS.
+                  </p>
+                  <Button size="sm" variant="outline" disabled={runCheck.isPending} onClick={() => runCheck.mutate()}>
+                    {runCheck.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <GitPullRequest className="size-3.5" />} Check GitHub connection
+                  </Button>
+                  {check?.results.map((r, idx) => (
+                    <div key={idx} className={cn("rounded-md px-2 py-1.5 text-[11px]", r.ok ? "bg-success/10 text-success" : "bg-danger/10 text-danger")}>
+                      {r.repo && <span className="font-mono">{r.repo}: </span>}
+                      {r.detail}
+                    </div>
+                  ))}
+                </CardContent>
+              </Card>
+            )}
             <Card>
               <CardHeader className="pb-2"><CardTitle className="flex items-center gap-2"><Users className="size-4 text-primary" /> System health</CardTitle></CardHeader>
               <CardContent className="space-y-2">

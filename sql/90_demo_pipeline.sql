@@ -1,9 +1,8 @@
 /* =====================================================================
    90 — Demo pipeline: ADE_DEMO_RETAIL + failure scenarios
    ---------------------------------------------------------------------
-   A small, realistic retail pipeline owned by SYSADMIN (like any
-   production database), plus SECURE owner's-rights procedures in
-   ADE_DB.CHAOS that break it in six repeatable ways:
+   A small, realistic retail pipeline plus SECURE owner's-rights procedures
+   in ADE_DB.CHAOS that break it in six repeatable ways:
 
      drop_target_table       MART.DAILY_REVENUE dropped        -> BUILD_DAILY_REVENUE fails (002003)
      upstream_column_rename  RAW.ORDERS.CHANNEL renamed        -> CLEAN_ORDERS fails (000904)
@@ -16,42 +15,101 @@
      LOAD_ORDERS -> CLEAN_ORDERS -> BUILD_DAILY_REVENUE -> PUBLISH_SNAPSHOT
    Dynamic table: MART.CUSTOMER_LTV (RAW.CUSTOMERS + STAGING.ORDERS_CLEAN)
 
+   Two owners of the code, one owner role:
+     - The pipeline code (schemas STAGING, MART, ORCHESTRATION, DEPLOY; the
+       tasks after LOAD_ORDERS; CUSTOMER_LTV; the target tables) lives in
+       GitHub, sfc-gh-jleong/ade-demo-retail, and is deployed by GitHub
+       Actions as GHA_ADE_DEMO_SVC (sql/10_demo_repo_deploy_user.sql).
+     - This file plays the source system: RAW and REF, their data, and the
+       root task LOAD_ORDERS (the e-commerce platform's loader). Scenarios
+       change these on purpose; a deploy from the repo never touches them.
+   Every task in a graph must have the same owner, so ADE_DEMO_OWNER owns
+   the database, the objects in it and the CHAOS procedures, and is the
+   deploy user's role. It is granted to SYSADMIN.
+
    The procedures are SECURE, so ADE_APP_ROLE (used by the agents and the
    app's Chaos Lab) can call them but cannot read how a scenario works.
 
    Setup order:
      snow sql -f sql/90_demo_pipeline.sql -c osm_deploy
      snow sql -f sql/03_scope_grants.sql -D "db=ADE_DEMO_RETAIL" -c osm_deploy
-     snow sql -q "CALL ADE_DB.CHAOS.RESET_DEMO()" -c osm_deploy
+     snow sql -q "CALL ADE_DB.CHAOS.RESET_DEMO(FALSE)" -c osm_deploy
+     then run the Deploy workflow in sfc-gh-jleong/ade-demo-retail, which
+     creates the repo's objects and runs the pipeline once.
+   Re-runnable: it re-applies ownership and grants and replaces the procedures.
    ===================================================================== */
+USE ROLE SECURITYADMIN;
+CREATE ROLE IF NOT EXISTS ADE_DEMO_OWNER
+  COMMENT = 'Owns ADE_DEMO_RETAIL and the ADE_DB.CHAOS procedures; role of the demo repo''s deploy user';
+GRANT ROLE ADE_DEMO_OWNER TO ROLE SYSADMIN;
+
+USE ROLE ACCOUNTADMIN;
+GRANT EXECUTE TASK ON ACCOUNT TO ROLE ADE_DEMO_OWNER;
+GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE ADE_DEMO_OWNER;
+-- The CHAOS procedures live in ADE_DB (owned by ADE_OWNER_ROLE).
+GRANT USAGE ON DATABASE ADE_DB TO ROLE ADE_DEMO_OWNER;
+
 USE ROLE SYSADMIN;
 USE WAREHOUSE COMPUTE_WH;
+USE SECONDARY ROLES NONE;
 
 CREATE DATABASE IF NOT EXISTS ADE_DEMO_RETAIL
   COMMENT = 'Retail demo pipeline (orders -> revenue mart) monitored by ADE Mission Control';
 
+-- Hand the database and everything in it to ADE_DEMO_OWNER. A task's owner
+-- can only change while it is suspended, and Snowflake suspends the tasks it
+-- transfers, so the children are resumed afterwards. The root stays suspended.
+ALTER TASK IF EXISTS ADE_DEMO_RETAIL.ORCHESTRATION.PUBLISH_SNAPSHOT SUSPEND;
+ALTER TASK IF EXISTS ADE_DEMO_RETAIL.ORCHESTRATION.BUILD_DAILY_REVENUE SUSPEND;
+ALTER TASK IF EXISTS ADE_DEMO_RETAIL.ORCHESTRATION.CLEAN_ORDERS SUSPEND;
+GRANT OWNERSHIP ON DATABASE ADE_DEMO_RETAIL TO ROLE ADE_DEMO_OWNER COPY CURRENT GRANTS;
+GRANT OWNERSHIP ON ALL SCHEMAS IN DATABASE ADE_DEMO_RETAIL TO ROLE ADE_DEMO_OWNER COPY CURRENT GRANTS;
+GRANT OWNERSHIP ON ALL TABLES IN DATABASE ADE_DEMO_RETAIL TO ROLE ADE_DEMO_OWNER COPY CURRENT GRANTS;
+GRANT OWNERSHIP ON ALL DYNAMIC TABLES IN DATABASE ADE_DEMO_RETAIL TO ROLE ADE_DEMO_OWNER COPY CURRENT GRANTS;
+GRANT OWNERSHIP ON ALL TASKS IN DATABASE ADE_DEMO_RETAIL TO ROLE ADE_DEMO_OWNER COPY CURRENT GRANTS;
+ALTER TASK IF EXISTS ADE_DEMO_RETAIL.ORCHESTRATION.PUBLISH_SNAPSHOT RESUME;
+ALTER TASK IF EXISTS ADE_DEMO_RETAIL.ORCHESTRATION.BUILD_DAILY_REVENUE RESUME;
+ALTER TASK IF EXISTS ADE_DEMO_RETAIL.ORCHESTRATION.CLEAN_ORDERS RESUME;
+
 CREATE SCHEMA IF NOT EXISTS ADE_DB.CHAOS
-  COMMENT = 'Failure scenarios for the ADE_DEMO_RETAIL demo pipeline (owned by SYSADMIN)';
+  COMMENT = 'Failure scenarios for the ADE_DEMO_RETAIL demo pipeline';
+GRANT USAGE ON SCHEMA ADE_DB.CHAOS TO ROLE ADE_DEMO_OWNER;
+-- The procedures are owned by ADE_DEMO_OWNER, so the objects they create
+-- (RAW and REF tables, LOAD_ORDERS) have the same owner as the repo's tasks.
+-- CREATE PROCEDURE is granted only while this script runs.
+GRANT CREATE PROCEDURE ON SCHEMA ADE_DB.CHAOS TO ROLE ADE_DEMO_OWNER;
+DROP PROCEDURE IF EXISTS ADE_DB.CHAOS.RESET_DEMO();
+DROP PROCEDURE IF EXISTS ADE_DB.CHAOS.RESET_DEMO(BOOLEAN);
+DROP PROCEDURE IF EXISTS ADE_DB.CHAOS.BREAK_DEMO(VARCHAR, BOOLEAN);
+DROP PROCEDURE IF EXISTS ADE_DB.CHAOS.RUN_DEMO();
+
+USE ROLE ADE_DEMO_OWNER;
+USE WAREHOUSE COMPUTE_WH;
 
 -- ---------------------------------------------------------------------
--- RESET_DEMO: rebuild ADE_DEMO_RETAIL in a healthy state with 14 days of
--- orders, run the graph once, and initialise the dynamic table.
+-- RESET_DEMO: reset the source side to a healthy state with 14 days of
+-- orders, empty the repo-managed tables, and (by default) run the pipeline
+-- once. Repo-managed definitions are never changed here: a missing object
+-- returns status 'deploy_needed' (run the repo's Deploy workflow).
+-- RUN_PIPELINE = FALSE resets data only (used by scripts/reset-to-baseline.sh
+-- in the repo, before it restores and deploys the baseline code).
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE SECURE PROCEDURE ADE_DB.CHAOS.RESET_DEMO()
+CREATE PROCEDURE ADE_DB.CHAOS.RESET_DEMO(RUN_PIPELINE BOOLEAN DEFAULT TRUE)
 RETURNS VARIANT
 LANGUAGE SQL
-COMMENT = 'Rebuild ADE_DEMO_RETAIL in a healthy state'
+COMMENT = 'Reset the source side of ADE_DEMO_RETAIL to a healthy state and optionally run the pipeline once'
 EXECUTE AS OWNER
 AS
 $$
 DECLARE
-  graph_status VARCHAR;
+  missing ARRAY;
+  graph_status VARCHAR DEFAULT 'NOT_RUN';
+  graph_error VARCHAR;
+  dt_error VARCHAR;
 BEGIN
-  CREATE OR REPLACE SCHEMA ADE_DEMO_RETAIL.RAW           COMMENT = 'Data as landed from source systems';
-  CREATE OR REPLACE SCHEMA ADE_DEMO_RETAIL.REF           COMMENT = 'Reference data';
-  CREATE OR REPLACE SCHEMA ADE_DEMO_RETAIL.STAGING       COMMENT = 'Cleaned and conformed data';
-  CREATE OR REPLACE SCHEMA ADE_DEMO_RETAIL.MART          COMMENT = 'Reporting tables';
-  CREATE OR REPLACE SCHEMA ADE_DEMO_RETAIL.ORCHESTRATION COMMENT = 'Pipeline tasks';
+  -- Source system: rebuilt with fresh data.
+  CREATE OR REPLACE SCHEMA ADE_DEMO_RETAIL.RAW COMMENT = 'Data as landed from source systems';
+  CREATE OR REPLACE SCHEMA ADE_DEMO_RETAIL.REF COMMENT = 'Reference data';
 
   CREATE TABLE ADE_DEMO_RETAIL.RAW.ORDERS (
     ORDER_ID     NUMBER(38,0)  NOT NULL,
@@ -76,34 +134,6 @@ BEGIN
     RATE_TO_USD  NUMBER(12,6)  NOT NULL
   ) COMMENT = 'FX rates to USD';
 
-  CREATE TABLE ADE_DEMO_RETAIL.STAGING.ORDERS_CLEAN (
-    ORDER_ID      NUMBER(38,0)  NOT NULL,
-    CUSTOMER_ID   NUMBER(38,0)  NOT NULL,
-    AMOUNT_USD    NUMBER(12,2),
-    DISCOUNT_USD  NUMBER(12,2),
-    ORDER_DATE    DATE          NOT NULL,
-    CHANNEL       VARCHAR(20)   NOT NULL,
-    UPDATED_AT    TIMESTAMP_NTZ NOT NULL
-  ) COMMENT = 'Orders conformed to USD, one row per order';
-
-  CREATE TABLE ADE_DEMO_RETAIL.MART.DAILY_REVENUE (
-    ORDER_DATE     DATE          NOT NULL,
-    CHANNEL        VARCHAR(20)   NOT NULL,
-    ORDERS         NUMBER(38,0)  NOT NULL,
-    REVENUE_USD    NUMBER(14,2),
-    AVG_ORDER_USD  NUMBER(12,2),
-    DISCOUNT_PCT   NUMBER(6,2),
-    BUILT_AT       TIMESTAMP_NTZ NOT NULL
-  ) COMMENT = 'Daily revenue by sales channel, rebuilt by the pipeline';
-
-  CREATE TABLE ADE_DEMO_RETAIL.MART.REVENUE_SNAPSHOTS (
-    SNAPSHOT_AT  TIMESTAMP_NTZ NOT NULL,
-    DAYS         NUMBER(38,0),
-    ORDERS       NUMBER(38,0),
-    REVENUE_USD  NUMBER(16,2)
-  ) COMMENT = 'Point-in-time revenue totals published after each build';
-
-  -- Seed data
   INSERT INTO ADE_DEMO_RETAIL.REF.FX_RATES VALUES
     ('USD', 1.000000), ('EUR', 1.081200), ('GBP', 1.268400), ('CAD', 0.731500);
 
@@ -124,8 +154,10 @@ BEGIN
          DATEADD(minute, -UNIFORM(0, 20160, RANDOM()), SYSDATE())
   FROM TABLE(GENERATOR(ROWCOUNT => 1500));
 
-  -- Task graph
-  CREATE TASK ADE_DEMO_RETAIL.ORCHESTRATION.LOAD_ORDERS
+  -- The root task is the platform's loader. CREATE OR ALTER keeps the repo's
+  -- tasks linked to it (CREATE OR REPLACE would detach them).
+  CREATE SCHEMA IF NOT EXISTS ADE_DEMO_RETAIL.ORCHESTRATION COMMENT = 'Pipeline tasks';
+  CREATE OR ALTER TASK ADE_DEMO_RETAIL.ORCHESTRATION.LOAD_ORDERS
     WAREHOUSE = COMPUTE_WH
     SCHEDULE = 'USING CRON 0 * * * * UTC'
     COMMENT = 'Lands the latest batch of orders from the e-commerce platform'
@@ -141,89 +173,88 @@ BEGIN
     FROM TABLE(GENERATOR(ROWCOUNT => 40)),
          (SELECT COALESCE(MAX(ORDER_ID), 100000) AS MAX_ID FROM ADE_DEMO_RETAIL.RAW.ORDERS) m;
 
-  CREATE TASK ADE_DEMO_RETAIL.ORCHESTRATION.CLEAN_ORDERS
-    WAREHOUSE = COMPUTE_WH
-    COMMENT = 'Converts recent orders to USD and upserts them into STAGING.ORDERS_CLEAN'
-    AFTER ADE_DEMO_RETAIL.ORCHESTRATION.LOAD_ORDERS
-  AS
-    MERGE INTO ADE_DEMO_RETAIL.STAGING.ORDERS_CLEAN t
-    USING (
-      SELECT o.ORDER_ID,
-             o.CUSTOMER_ID,
-             ROUND(o.AMOUNT::NUMBER(12,2)   * fx.RATE_TO_USD, 2) AS AMOUNT_USD,
-             ROUND(o.DISCOUNT::NUMBER(12,2) * fx.RATE_TO_USD, 2) AS DISCOUNT_USD,
-             o.ORDER_TS::DATE AS ORDER_DATE,
-             o.CHANNEL
-      FROM ADE_DEMO_RETAIL.RAW.ORDERS o
-      JOIN ADE_DEMO_RETAIL.REF.FX_RATES fx ON fx.CURRENCY = o.CURRENCY
-      WHERE o._LOADED_AT >= DATEADD(day, -2, SYSDATE())
-    ) s
-    ON t.ORDER_ID = s.ORDER_ID
-    WHEN MATCHED THEN UPDATE SET
-      t.CUSTOMER_ID = s.CUSTOMER_ID, t.AMOUNT_USD = s.AMOUNT_USD, t.DISCOUNT_USD = s.DISCOUNT_USD,
-      t.ORDER_DATE = s.ORDER_DATE, t.CHANNEL = s.CHANNEL, t.UPDATED_AT = SYSDATE()
-    WHEN NOT MATCHED THEN INSERT (ORDER_ID, CUSTOMER_ID, AMOUNT_USD, DISCOUNT_USD, ORDER_DATE, CHANNEL, UPDATED_AT)
-      VALUES (s.ORDER_ID, s.CUSTOMER_ID, s.AMOUNT_USD, s.DISCOUNT_USD, s.ORDER_DATE, s.CHANNEL, SYSDATE());
+  -- Repo-managed objects that are missing, or tasks no longer linked to the
+  -- graph, can only come back through a deploy of the repo.
+  SELECT COALESCE(ARRAY_AGG(o.N) WITHIN GROUP (ORDER BY o.N), ARRAY_CONSTRUCT()) INTO :missing
+  FROM (VALUES ('STAGING.ORDERS_CLEAN', 'TABLE'), ('MART.DAILY_REVENUE', 'TABLE'), ('MART.REVENUE_SNAPSHOTS', 'TABLE'),
+               ('MART.CUSTOMER_LTV', 'TABLE'), ('DEPLOY.CHANGE_HISTORY', 'TABLE'),
+               ('ORCHESTRATION.CLEAN_ORDERS', 'TASK'), ('ORCHESTRATION.BUILD_DAILY_REVENUE', 'TASK'),
+               ('ORCHESTRATION.PUBLISH_SNAPSHOT', 'TASK')) AS o (N, K)
+  WHERE (o.K = 'TABLE' AND NOT EXISTS (
+           SELECT 1 FROM ADE_DEMO_RETAIL.INFORMATION_SCHEMA.TABLES t WHERE t.TABLE_SCHEMA || '.' || t.TABLE_NAME = o.N))
+     OR (o.K = 'TASK' AND NOT EXISTS (
+           SELECT 1 FROM TABLE(ADE_DEMO_RETAIL.INFORMATION_SCHEMA.TASK_DEPENDENTS(
+                    TASK_NAME => 'ADE_DEMO_RETAIL.ORCHESTRATION.LOAD_ORDERS', RECURSIVE => TRUE)) d
+           WHERE d.SCHEMA_NAME || '.' || d.NAME = o.N));
 
-  CREATE TASK ADE_DEMO_RETAIL.ORCHESTRATION.BUILD_DAILY_REVENUE
-    WAREHOUSE = COMPUTE_WH
-    COMMENT = 'Rebuilds MART.DAILY_REVENUE from STAGING.ORDERS_CLEAN'
-    AFTER ADE_DEMO_RETAIL.ORCHESTRATION.CLEAN_ORDERS
-  AS
-    INSERT OVERWRITE INTO ADE_DEMO_RETAIL.MART.DAILY_REVENUE
-      (ORDER_DATE, CHANNEL, ORDERS, REVENUE_USD, AVG_ORDER_USD, DISCOUNT_PCT, BUILT_AT)
-    SELECT ORDER_DATE,
-           CHANNEL,
-           COUNT(*),
-           SUM(AMOUNT_USD),
-           ROUND(SUM(AMOUNT_USD) / COUNT(*), 2),
-           ROUND(100 * SUM(DISCOUNT_USD) / SUM(AMOUNT_USD), 2),
-           SYSDATE()
-    FROM ADE_DEMO_RETAIL.STAGING.ORDERS_CLEAN
-    GROUP BY ORDER_DATE, CHANNEL;
+  -- Repo-managed objects that exist: empty their data and resume them
+  -- (Snowflake suspends tasks after repeated failures). Definitions are left
+  -- alone. Each statement runs only if its object exists (IF EXISTS does not
+  -- cover a missing schema).
+  IF (NOT ARRAY_CONTAINS('STAGING.ORDERS_CLEAN'::VARIANT, :missing)) THEN
+    TRUNCATE TABLE ADE_DEMO_RETAIL.STAGING.ORDERS_CLEAN;
+  END IF;
+  IF (NOT ARRAY_CONTAINS('MART.DAILY_REVENUE'::VARIANT, :missing)) THEN
+    TRUNCATE TABLE ADE_DEMO_RETAIL.MART.DAILY_REVENUE;
+  END IF;
+  IF (NOT ARRAY_CONTAINS('MART.REVENUE_SNAPSHOTS'::VARIANT, :missing)) THEN
+    TRUNCATE TABLE ADE_DEMO_RETAIL.MART.REVENUE_SNAPSHOTS;
+  END IF;
+  IF (NOT ARRAY_CONTAINS('ORCHESTRATION.PUBLISH_SNAPSHOT'::VARIANT, :missing)) THEN
+    ALTER TASK ADE_DEMO_RETAIL.ORCHESTRATION.PUBLISH_SNAPSHOT RESUME;
+  END IF;
+  IF (NOT ARRAY_CONTAINS('ORCHESTRATION.BUILD_DAILY_REVENUE'::VARIANT, :missing)) THEN
+    ALTER TASK ADE_DEMO_RETAIL.ORCHESTRATION.BUILD_DAILY_REVENUE RESUME;
+  END IF;
+  IF (NOT ARRAY_CONTAINS('ORCHESTRATION.CLEAN_ORDERS'::VARIANT, :missing)) THEN
+    ALTER TASK ADE_DEMO_RETAIL.ORCHESTRATION.CLEAN_ORDERS RESUME;
+  END IF;
+  IF (NOT ARRAY_CONTAINS('MART.CUSTOMER_LTV'::VARIANT, :missing)) THEN
+    ALTER DYNAMIC TABLE ADE_DEMO_RETAIL.MART.CUSTOMER_LTV RESUME;
+  END IF;
 
-  CREATE TASK ADE_DEMO_RETAIL.ORCHESTRATION.PUBLISH_SNAPSHOT
-    WAREHOUSE = COMPUTE_WH
-    COMMENT = 'Publishes a revenue snapshot for the finance dashboard'
-    AFTER ADE_DEMO_RETAIL.ORCHESTRATION.BUILD_DAILY_REVENUE
-  AS
-    INSERT INTO ADE_DEMO_RETAIL.MART.REVENUE_SNAPSHOTS (SNAPSHOT_AT, DAYS, ORDERS, REVENUE_USD)
-    SELECT SYSDATE(), COUNT(DISTINCT ORDER_DATE), SUM(ORDERS), SUM(REVENUE_USD)
-    FROM ADE_DEMO_RETAIL.MART.DAILY_REVENUE;
+  IF (ARRAY_SIZE(:missing) > 0) THEN
+    RETURN OBJECT_CONSTRUCT(
+      'status', 'deploy_needed',
+      'missing', :missing,
+      'message', 'Run the Deploy workflow in sfc-gh-jleong/ade-demo-retail to recreate these objects.',
+      'reset_at', SYSDATE());
+  END IF;
 
-  -- Children resumed, root left suspended (runs via EXECUTE TASK only).
-  ALTER TASK ADE_DEMO_RETAIL.ORCHESTRATION.PUBLISH_SNAPSHOT RESUME;
-  ALTER TASK ADE_DEMO_RETAIL.ORCHESTRATION.BUILD_DAILY_REVENUE RESUME;
-  ALTER TASK ADE_DEMO_RETAIL.ORCHESTRATION.CLEAN_ORDERS RESUME;
+  IF (:RUN_PIPELINE) THEN
+    BEGIN
+      EXECUTE TASK ADE_DEMO_RETAIL.ORCHESTRATION.LOAD_ORDERS AWAIT;
+      graph_status := 'SUCCEEDED';
+    EXCEPTION
+      WHEN OTHER THEN
+        graph_status := 'FAILED';
+        graph_error := SQLERRM;
+    END;
+    BEGIN
+      ALTER DYNAMIC TABLE ADE_DEMO_RETAIL.MART.CUSTOMER_LTV REFRESH;
+    EXCEPTION
+      WHEN OTHER THEN dt_error := SQLERRM;
+    END;
+  END IF;
 
-  EXECUTE TASK ADE_DEMO_RETAIL.ORCHESTRATION.LOAD_ORDERS AWAIT;
-  graph_status := 'SUCCEEDED';
-
-  CREATE DYNAMIC TABLE ADE_DEMO_RETAIL.MART.CUSTOMER_LTV
-    TARGET_LAG = '1 day'
-    WAREHOUSE = COMPUTE_WH
-    COMMENT = 'Customer lifetime value by region'
-  AS
-    SELECT c.CUSTOMER_ID,
-           c.FULL_NAME,
-           c.REGION,
-           COUNT(o.ORDER_ID)  AS ORDERS,
-           SUM(o.AMOUNT_USD)  AS LIFETIME_USD,
-           MAX(o.ORDER_DATE)  AS LAST_ORDER_DATE
-    FROM ADE_DEMO_RETAIL.RAW.CUSTOMERS c
-    LEFT JOIN ADE_DEMO_RETAIL.STAGING.ORDERS_CLEAN o ON o.CUSTOMER_ID = c.CUSTOMER_ID
-    GROUP BY c.CUSTOMER_ID, c.FULL_NAME, c.REGION;
-
-  RETURN OBJECT_CONSTRUCT('status', 'healthy', 'graph_run', graph_status, 'reset_at', SYSDATE());
+  RETURN OBJECT_CONSTRUCT(
+    'status', IFF(:graph_status = 'FAILED' OR :dt_error IS NOT NULL, 'unhealthy', 'healthy'),
+    'graph_run', :graph_status,
+    'graph_error', :graph_error,
+    'dt_refresh_error', :dt_error,
+    'hint', IFF(:graph_status = 'FAILED' OR :dt_error IS NOT NULL,
+                'The pipeline failed on fresh source data. If a fix was merged in sfc-gh-jleong/ade-demo-retail, run scripts/reset-to-baseline.sh there.',
+                NULL),
+    'reset_at', SYSDATE());
 END;
 $$;
 
 -- ---------------------------------------------------------------------
 -- BREAK_DEMO: inject one failure scenario and trigger the affected job so
 -- the failure is recorded within about a minute. RESET first so scenarios
--- never stack.
+-- never stack; nothing is injected unless the reset left the pipeline healthy.
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE SECURE PROCEDURE ADE_DB.CHAOS.BREAK_DEMO(SCENARIO VARCHAR, RESET_FIRST BOOLEAN DEFAULT TRUE)
+CREATE PROCEDURE ADE_DB.CHAOS.BREAK_DEMO(SCENARIO VARCHAR, RESET_FIRST BOOLEAN DEFAULT TRUE)
 RETURNS VARIANT
 LANGUAGE SQL
 COMMENT = 'Inject a failure scenario into ADE_DEMO_RETAIL and trigger the affected job'
@@ -234,6 +265,7 @@ DECLARE
   s VARCHAR;
   failing_job VARCHAR;
   trigger_error VARCHAR;
+  reset_result VARIANT;
   unknown_scenario EXCEPTION (-20001, 'Unknown scenario');
 BEGIN
   s := LOWER(TRIM(:SCENARIO));
@@ -243,7 +275,14 @@ BEGIN
   END IF;
 
   IF (:RESET_FIRST) THEN
-    CALL ADE_DB.CHAOS.RESET_DEMO();
+    CALL ADE_DB.CHAOS.RESET_DEMO(TRUE) INTO :reset_result;
+    IF (GET(:reset_result, 'status')::VARCHAR <> 'healthy') THEN
+      RETURN OBJECT_CONSTRUCT(
+        'scenario', s,
+        'status', 'not_injected',
+        'reason', 'The reset did not leave the pipeline healthy, so the scenario was not injected.',
+        'reset', :reset_result);
+    END IF;
   END IF;
 
   IF (s = 'drop_target_table') THEN
@@ -310,6 +349,7 @@ BEGIN
 
   RETURN OBJECT_CONSTRUCT(
     'scenario', s,
+    'status', 'injected',
     'expected_failing_job', failing_job,
     'trigger_error', trigger_error,
     'triggered_at', SYSDATE());
@@ -317,7 +357,7 @@ END;
 $$;
 
 -- RUN_DEMO: trigger a normal run of the pipeline (graph + DT refresh).
-CREATE OR REPLACE SECURE PROCEDURE ADE_DB.CHAOS.RUN_DEMO()
+CREATE PROCEDURE ADE_DB.CHAOS.RUN_DEMO()
 RETURNS VARIANT
 LANGUAGE SQL
 COMMENT = 'Trigger a run of the ADE_DEMO_RETAIL task graph and dynamic table'
@@ -338,7 +378,18 @@ END;
 $$;
 
 -- The app's Chaos Lab calls these as ADE_APP_ROLE. SECURE hides the bodies.
-GRANT USAGE ON SCHEMA ADE_DB.CHAOS TO ROLE ADE_APP_ROLE;
-GRANT USAGE ON PROCEDURE ADE_DB.CHAOS.RESET_DEMO() TO ROLE ADE_APP_ROLE;
+GRANT USAGE ON PROCEDURE ADE_DB.CHAOS.RESET_DEMO(BOOLEAN) TO ROLE ADE_APP_ROLE;
 GRANT USAGE ON PROCEDURE ADE_DB.CHAOS.BREAK_DEMO(VARCHAR, BOOLEAN) TO ROLE ADE_APP_ROLE;
 GRANT USAGE ON PROCEDURE ADE_DB.CHAOS.RUN_DEMO() TO ROLE ADE_APP_ROLE;
+
+USE ROLE SYSADMIN;
+GRANT USAGE ON SCHEMA ADE_DB.CHAOS TO ROLE ADE_APP_ROLE;
+REVOKE CREATE PROCEDURE ON SCHEMA ADE_DB.CHAOS FROM ROLE ADE_DEMO_OWNER;
+
+-- Verify: owners in the demo database (expect ADE_DEMO_OWNER only) and the procedures.
+SHOW OBJECTS IN DATABASE ADE_DEMO_RETAIL
+  ->> SELECT "owner", "kind", COUNT(*) AS objects FROM $1 WHERE "schema_name" <> 'INFORMATION_SCHEMA' GROUP BY 1, 2 ORDER BY 1, 2;
+SHOW TASKS IN DATABASE ADE_DEMO_RETAIL
+  ->> SELECT "name", "owner", "state" FROM $1 ORDER BY 1;
+SHOW PROCEDURES IN SCHEMA ADE_DB.CHAOS
+  ->> SELECT "name", "arguments" FROM $1 WHERE "is_builtin" = 'N';

@@ -7,8 +7,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { motion } from "motion/react"
 import { diffLines } from "diff"
 import {
-  AlertTriangle, ArrowLeft, BadgeCheck, Ban, CheckCircle2, CircleSlash, Clock, Copy, FileCode2, FlaskConical, GitCompare, Hash, History,
-  ListChecks, Loader2, Play, RotateCcw, Search, ShieldCheck, Sparkles, Timer, Undo2, Zap,
+  AlertTriangle, ArrowLeft, BadgeCheck, Ban, CheckCircle2, CircleSlash, Clock, Copy, ExternalLink, FileCode2, FlaskConical, GitCompare, GitMerge, GitPullRequest,
+  Hash, History, ListChecks, Loader2, Play, Rocket, RotateCcw, Search, ShieldCheck, Sparkles, Timer, Undo2, Zap,
 } from "lucide-react"
 import { api, ago, clock, compactTokens, credits, duration } from "@/lib/client"
 import { useLiveInvalidation } from "@/lib/live"
@@ -172,6 +172,124 @@ function ApprovalPanel({ data, me, onAction, pending }: { data: Detail; me: { us
   )
 }
 
+const GITHUB = "https://github.com"
+const repoUrl = (repo: string) => (/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(repo) ? `${GITHUB}/${repo}` : GITHUB)
+const githubHref = (url: string | null | undefined) => (url && url.startsWith(`${GITHUB}/`) ? url : null)
+
+function ExtLink({ href, children }: { href: string | null; children: React.ReactNode }) {
+  if (!href) return <>{children}</>
+  return (
+    <a href={href} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-primary hover:underline">
+      {children}
+      <ExternalLink className="size-3" />
+    </a>
+  )
+}
+
+/** Git delivery: the fix travels as a pull request (or a deploy of main); people act on GitHub. */
+function PullRequestPanel({ data, me, onAction, pending }: { data: Detail; me: { user: string; approver: boolean } | undefined; onAction: (body: Record<string, unknown>) => void; pending: string | null }) {
+  const incident = data.incident
+  const fix = data.fixes.find((f: Detail) => f.id === incident.currentFixId) ?? data.fixes[0]
+  const pr = data.pullRequests.find((p: Detail) => p.fixId === fix?.id) ?? null
+  const repo: string = pr?.repo ?? data.delivery.repo ?? ""
+  const prHref = githubHref(pr?.url)
+  const deployHref = `${repoUrl(repo)}/actions/workflows/deploy.yml`
+  const change = fix?.sourceChange
+  const title = !pr ? "Managed in Git" : pr.state === "DEPLOY_NEEDED" ? "Deploy needed" : pr.number ? `Pull request #${pr.number}` : "Pull request"
+  return (
+    <Card className="border-primary/30 bg-primary/[0.03]">
+      <CardContent className="space-y-3 p-4">
+        <div className="flex items-start gap-3">
+          {pr?.state === "MERGED" || pr?.state === "DEPLOYED" ? <GitMerge className="mt-0.5 size-5 text-primary" /> : pr?.state === "DEPLOY_NEEDED" ? <Rocket className="mt-0.5 size-5 text-warning" /> : <GitPullRequest className="mt-0.5 size-5 text-primary" />}
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-semibold">
+              <ExtLink href={prHref}>{title}</ExtLink>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              This job&apos;s code lives in <ExtLink href={repoUrl(repo)}>{repo || "Git"}</ExtLink>. A person reviews and merges on GitHub, GitHub Actions deploys, and Mission Control resolves the
+              incident after the job&apos;s next successful run. Approve, Apply and Roll back are not available here.
+            </p>
+          </div>
+          {pr && <StatusPill status={pr.state} />}
+        </div>
+
+        {pr && (
+          <dl className="grid gap-x-6 gap-y-1.5 text-xs sm:grid-cols-2">
+            {pr.path && <PrRow k="File" v={<span className="font-mono">{pr.path}</span>} />}
+            {pr.branch && <PrRow k="Branch" v={<span className="font-mono">{pr.branch}</span>} />}
+            {pr.state === "OPEN" && <PrRow k="Approvals" v={pr.approvedBy.length ? pr.approvedBy.join(", ") : pr.changesRequested ? "Changes requested" : "None yet"} />}
+            {pr.mergedBy && <PrRow k="Merged" v={`${pr.mergedBy} · ${ago(pr.mergedAt)}`} />}
+            {pr.deployedAt && (
+              <PrRow
+                k="Deployed"
+                v={
+                  <span>
+                    <ExtLink href={githubHref(pr.deployRunUrl)}>{`commit ${String(pr.deployCommitSha ?? "").slice(0, 7)}`}</ExtLink> · {ago(pr.deployedAt)}
+                    {pr.pipelineStatus && <> · pipeline {String(pr.pipelineStatus).toLowerCase()}</>}
+                  </span>
+                }
+              />
+            )}
+            {pr.lastSyncedAt && <PrRow k="Checked" v={ago(pr.lastSyncedAt)} />}
+          </dl>
+        )}
+
+        {pr?.drift === "CHANGED_AFTER_REVIEW" && (
+          <div className="flex items-center gap-2 rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">
+            <AlertTriangle className="size-4" /> Commits were pushed to this pull request after ADE&apos;s review, so what merged is not exactly what the agents reviewed.
+          </div>
+        )}
+        {pr?.drift === "PRODUCTION_DIFFERS" && (
+          <div className="flex items-center gap-2 rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">
+            <AlertTriangle className="size-4" /> Production&apos;s definition of this job differs from the file in the repo.
+          </div>
+        )}
+        {pr?.lastError && pr.state !== "DEPLOYED" && <div className="rounded-md bg-muted px-3 py-2 text-xs text-muted-foreground">{String(pr.lastError).replace(/^DEPLOY_TIMEOUT: /, "")}</div>}
+
+        <div className="flex flex-wrap items-center gap-2">
+          {prHref && (
+            <Button asChild size="sm">
+              <a href={prHref} target="_blank" rel="noopener noreferrer">
+                <GitPullRequest className="size-3.5" /> Review on GitHub
+              </a>
+            </Button>
+          )}
+          {(pr?.state === "DEPLOY_NEEDED" || pr?.state === "MERGED") && repo && (
+            <Button asChild size="sm" variant={pr?.state === "DEPLOY_NEEDED" ? "default" : "outline"}>
+              <a href={deployHref} target="_blank" rel="noopener noreferrer">
+                <Rocket className="size-3.5" /> Open the Deploy workflow
+              </a>
+            </Button>
+          )}
+          {me?.approver && ["VERIFYING", "NEEDS_HUMAN", "RESOLVED"].includes(incident.status) && (
+            <Button variant="ghost" size="sm" disabled={pending !== null} onClick={() => onAction({ action: "run_job" })}>
+              {pending === "run_job" ? <Loader2 className="size-4 animate-spin" /> : <Play className="size-4" />} Run job now
+            </Button>
+          )}
+        </div>
+
+        {change?.diff && (
+          <div>
+            <div className="mb-1.5 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Change reviewed by the agents <SealBadge state={change.seal} />
+            </div>
+            <CodeBlock lang="diff" code={change.diff} maxHeight={360} />
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function PrRow({ k, v }: { k: string; v: React.ReactNode }) {
+  return (
+    <div className="flex gap-2">
+      <dt className="w-20 shrink-0 text-muted-foreground">{k}</dt>
+      <dd className="min-w-0 break-words">{v}</dd>
+    </div>
+  )
+}
+
 function IncidentInner() {
   const { id } = useParams<{ id: string }>()
   const search = useSearchParams()
@@ -285,7 +403,7 @@ function IncidentInner() {
                 {i.status === "DETECTED" ? "Send to the agents" : "Retry with the agents"}
               </Button>
             )}
-            {!["RESOLVED", "SUPPRESSED", "APPLYING", "VERIFYING"].includes(i.status) && (
+            {!["RESOLVED", "SUPPRESSED", "APPLYING", "DEPLOYING", "VERIFYING"].includes(i.status) && (
               <Button size="sm" variant="ghost" disabled={pending !== null} onClick={() => action.mutate({ action: "dismiss", note: "Dismissed from Mission Control" })}>
                 <CircleSlash className="size-3.5" /> Dismiss
               </Button>
@@ -295,7 +413,11 @@ function IncidentInner() {
         </CardContent>
       </Card>
 
-      {currentFix && ["AWAITING_APPROVAL", "APPROVED", "APPLYING", "VERIFYING", "RESOLVED", "NEEDS_HUMAN"].includes(i.status) && ["AWAITING_APPROVAL", "APPROVED", "APPLIED", "VERIFIED", "VERIFY_FAILED", "APPLY_FAILED"].includes(currentFix.status) && (
+      {d.delivery?.mode === "PULL_REQUEST" && (d.pullRequests.length > 0 || ["PR_OPEN", "DEPLOYING", "VERIFYING"].includes(i.status)) && (
+        <PullRequestPanel data={d} me={me.data} pending={pending} onAction={(body) => action.mutate(body)} />
+      )}
+
+      {d.delivery?.mode !== "PULL_REQUEST" && currentFix && ["AWAITING_APPROVAL", "APPROVED", "APPLYING", "VERIFYING", "RESOLVED", "NEEDS_HUMAN"].includes(i.status) && ["AWAITING_APPROVAL", "APPROVED", "APPLIED", "VERIFIED", "VERIFY_FAILED", "APPLY_FAILED"].includes(currentFix.status) && (
         <ApprovalPanel data={d} me={me.data} pending={pending} onAction={(body) => action.mutate(body)} />
       )}
 

@@ -15,7 +15,13 @@
      - its own statement screen.
 
      APPROVERS          users who may approve/apply/roll back
-     MANAGED_DATABASES  databases fixes may change (03_scope_grants.sql adds)
+     MANAGED_DATABASES  databases fixes may change (03_scope_grants.sql adds),
+                        and how fixes reach them (DELIVERY):
+                          APPLY         a person approves and applies here
+                          PULL_REQUEST  the code lives in Git (REPO); fixes reach
+                                        production only through a reviewed pull
+                                        request, so approve/apply/roll back refuse
+                                        (09_git_delivery.sql)
      DECISIONS          append-only record of every human decision
      FIX_HASH()         canonical hash of a fix (also used by the app)
      SCREEN_STATEMENT() server-side statement screen
@@ -44,6 +50,12 @@ CREATE TABLE IF NOT EXISTS ADE_DB.GUARD.MANAGED_DATABASES (
   ADDED_BY      VARCHAR(255) NOT NULL DEFAULT CURRENT_USER(),
   ADDED_AT      TIMESTAMP_NTZ NOT NULL DEFAULT SYSDATE()
 ) COMMENT = 'Databases ADE fixes may change (maintained by sql/03_scope_grants.sql)';
+
+ALTER TABLE ADE_DB.GUARD.MANAGED_DATABASES ADD COLUMN IF NOT EXISTS
+  DELIVERY VARCHAR(20) DEFAULT 'APPLY' COMMENT 'APPLY: GUARD applies approved fixes. PULL_REQUEST: fixes reach production only through a reviewed pull request to REPO';
+ALTER TABLE ADE_DB.GUARD.MANAGED_DATABASES ADD COLUMN IF NOT EXISTS
+  REPO VARCHAR(200) COMMENT 'GitHub repository (owner/name) holding the code when DELIVERY = PULL_REQUEST';
+UPDATE ADE_DB.GUARD.MANAGED_DATABASES SET DELIVERY = 'APPLY' WHERE DELIVERY IS NULL;
 
 MERGE INTO ADE_DB.GUARD.MANAGED_DATABASES t
   USING (SELECT 'SNOWFLAKE_DEMO' AS D UNION ALL SELECT 'ADE_DEMO_RETAIL') s ON t.DATABASE_NAME = s.D
@@ -147,6 +159,16 @@ $$
   AND EXISTS (SELECT 1 FROM ADE_DB.GUARD.MANAGED_DATABASES WHERE DATABASE_NAME = UPPER(D) AND ACTIVE)
 $$;
 
+-- Deliberately ignores ACTIVE: a database that is managed in Git is refused
+-- here even if someone switches it off in MANAGED_DATABASES.
+CREATE OR REPLACE FUNCTION ADE_DB.GUARD.IS_GIT_MANAGED_DATABASE(D VARCHAR)
+RETURNS BOOLEAN
+COMMENT = 'TRUE if this database''s code lives in Git: fixes reach it only through a reviewed pull request'
+AS
+$$
+  EXISTS (SELECT 1 FROM ADE_DB.GUARD.MANAGED_DATABASES WHERE DATABASE_NAME = UPPER(D) AND DELIVERY = 'PULL_REQUEST')
+$$;
+
 -- ---------------------------------------------------------------------
 -- APPROVE_FIX / REJECT_FIX
 -- ---------------------------------------------------------------------
@@ -171,12 +193,14 @@ DECLARE
   hash_changed EXCEPTION (-20103, 'The fix changed since you loaded it; reload and review again');
   low_conf EXCEPTION (-20104, 'The latest review does not allow approval (verdict must be APPROVE and confidence above the minimum)');
   bad_db EXCEPTION (-20106, 'Fixes may not change this database');
+  git_managed EXCEPTION (-20108, 'This database is managed in Git; review its pull request');
 BEGIN
   IF (NOT ADE_DB.GUARD.IS_APPROVER(:who)) THEN RAISE not_allowed; END IF;
   SELECT f.INCIDENT_ID, f.STATUS, i.DATABASE_NAME, ADE_DB.GUARD.FIX_HASH(i.DATABASE_NAME, f.STATEMENTS, f.ROLLBACK_STATEMENTS)
     INTO :inc, :st, :db, :h
     FROM ADE_DB.OPS.FIXES f JOIN ADE_DB.OPS.INCIDENTS i ON i.INCIDENT_ID = f.INCIDENT_ID
     WHERE f.FIX_ID = :FIX_ID;
+  IF (ADE_DB.GUARD.IS_GIT_MANAGED_DATABASE(:db)) THEN RAISE git_managed; END IF;
   IF (st IS DISTINCT FROM 'AWAITING_APPROVAL') THEN RAISE bad_state; END IF;
   IF (h IS DISTINCT FROM :EXPECTED_HASH) THEN RAISE hash_changed; END IF;
   IF (NOT ADE_DB.GUARD.IS_MANAGED_DATABASE(:db)) THEN RAISE bad_db; END IF;
@@ -323,6 +347,7 @@ DECLARE
   hash_changed EXCEPTION (-20103, 'The fix changed after approval; it must be reviewed and approved again');
   screen_failed EXCEPTION (-20105, 'A statement failed the guard screen');
   bad_db EXCEPTION (-20106, 'Fixes may not change this database');
+  git_managed EXCEPTION (-20108, 'This database is managed in Git; review its pull request');
 BEGIN
   IF (NOT ADE_DB.GUARD.IS_APPROVER(:who)) THEN RAISE not_allowed; END IF;
   SELECT f.INCIDENT_ID, f.STATUS, f.STATEMENTS, f.TARGET_OBJECTS, i.DATABASE_NAME,
@@ -330,6 +355,7 @@ BEGIN
     INTO :inc, :st, :stmts, :targets, :db, :h
     FROM ADE_DB.OPS.FIXES f JOIN ADE_DB.OPS.INCIDENTS i ON i.INCIDENT_ID = f.INCIDENT_ID
     WHERE f.FIX_ID = :FIX_ID;
+  IF (ADE_DB.GUARD.IS_GIT_MANAGED_DATABASE(:db)) THEN RAISE git_managed; END IF;
   -- Approval comes from GUARD.DECISIONS (not writable by the app), and must be
   -- the latest decision on this fix, for exactly this hash.
   SELECT MAX_BY(DECISION, DECIDED_AT), MAX_BY(FIX_HASH, DECIDED_AT) INTO :last_decision, :last_hash
@@ -446,12 +472,14 @@ DECLARE
   hash_changed EXCEPTION (-20103, 'The fix changed after it was applied; refusing to run its rollback');
   screen_failed EXCEPTION (-20105, 'A rollback statement failed the guard screen');
   bad_db EXCEPTION (-20106, 'Fixes may not change this database');
+  git_managed EXCEPTION (-20108, 'This database is managed in Git; revert the change with a pull request');
 BEGIN
   IF (NOT ADE_DB.GUARD.IS_APPROVER(:who)) THEN RAISE not_allowed; END IF;
   SELECT f.INCIDENT_ID, f.ROLLBACK_STATEMENTS, f.STATEMENTS, i.DATABASE_NAME, ADE_DB.GUARD.FIX_HASH(i.DATABASE_NAME, f.STATEMENTS, f.ROLLBACK_STATEMENTS)
     INTO :inc, :rb, :fwd, :db, :h
     FROM ADE_DB.OPS.FIXES f JOIN ADE_DB.OPS.INCIDENTS i ON i.INCIDENT_ID = f.INCIDENT_ID
     WHERE f.FIX_ID = :FIX_ID;
+  IF (ADE_DB.GUARD.IS_GIT_MANAGED_DATABASE(:db)) THEN RAISE git_managed; END IF;
   SELECT MAX_BY(FIX_HASH, DECIDED_AT) INTO :applied_hash
     FROM ADE_DB.GUARD.DECISIONS WHERE FIX_ID = :FIX_ID AND DECISION IN ('APPLIED', 'APPLY_FAILED');
   IF (applied_hash IS NULL) THEN RAISE bad_state; END IF;
@@ -512,6 +540,7 @@ GRANT SELECT ON TABLE ADE_DB.GUARD.MANAGED_DATABASES TO ROLE ADE_APP_ROLE;
 GRANT USAGE ON FUNCTION ADE_DB.GUARD.FIX_HASH(VARCHAR, ARRAY, ARRAY) TO ROLE ADE_APP_ROLE;
 GRANT USAGE ON FUNCTION ADE_DB.GUARD.SCREEN_STATEMENT(VARCHAR) TO ROLE ADE_APP_ROLE;
 GRANT USAGE ON FUNCTION ADE_DB.GUARD.SCREEN_ROLLBACK_STATEMENT(VARCHAR, ARRAY) TO ROLE ADE_APP_ROLE;
+GRANT USAGE ON FUNCTION ADE_DB.GUARD.IS_GIT_MANAGED_DATABASE(VARCHAR) TO ROLE ADE_APP_ROLE;
 
 USE ROLE ACCOUNTADMIN;
 GRANT CALLER USAGE ON PROCEDURE ADE_DB.GUARD.APPROVE_FIX(VARCHAR, VARCHAR, VARCHAR) TO ROLE ADE_APP_ROLE;

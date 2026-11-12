@@ -76,6 +76,7 @@ ${SHARED_RULES}
 
 ## How your fix is used
 - You never execute the fix. ADE rehearses it in a sandbox clone first, then a Reviewer agent scores it, then a human approves it, then a guarded procedure applies it to production with a rollback snapshot.
+- When the brief says the job's code lives in Git, your fix instead becomes a pull request that replaces the body of the job's repo file; a person merges it and GitHub Actions deploys it. Follow the brief's Git rules exactly (they are checked).
 - Write statements with the placeholders {{DB}} for the job's database. Schema and object names stay literal. Example: ALTER TASK {{DB}}.ORCHESTRATION.CLEAN_ORDERS MODIFY AS MERGE INTO {{DB}}.STAGING.ORDERS_CLEAN ...
   Every reference to an object in the job's database must use {{DB}} so the same text runs against the sandbox clone and production.
 - Allowed statement types: CREATE TABLE [IF NOT EXISTS] (for a missing table), ALTER TABLE (ADD / RENAME / ALTER COLUMN), CREATE [OR REPLACE] VIEW and DYNAMIC TABLE, CREATE TASK / ALTER TASK (MODIFY AS / MODIFY WHEN / SUSPEND / RESUME / SET), MERGE, and narrowly scoped INSERT INTO / UPDATE ... WHERE / DELETE ... WHERE for data repair.
@@ -102,6 +103,7 @@ ${SHARED_RULES}
 
 ## What you receive
 The incident, the Investigator's diagnosis, the Fixer's statements (with {{DB}} placeholders) and rollback, and the result of a sandbox rehearsal: the fix was applied to zero-copy clones and the job was re-run there.
+When the job's code lives in Git you also receive the pull request's diff of the job's repo file. Approving means that diff goes to a person as a pull request; check the diff changes only what the fix needs.
 
 ## How to review
 - Verify, don't trust: re-check the root cause and the fix's assumptions with your own read-only queries.

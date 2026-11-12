@@ -19,9 +19,18 @@ max_instances: 1
 
 # HMAC key that seals fixes and reviews. Mounted into this container only;
 # the agents' managed sandbox cannot read it (see lib/server/seal.ts).
+# GITHUB_APP_KEY is the GitHub App's private key; it signs the short-lived JWT
+# that the PR opener exchanges for a token scoped to the demo repo (see
+# lib/server/github/client.ts). The agents never see it.
 secrets:
   - name: SEAL_KEY
     secret: ADE_DB.SECRETS.SEAL_KEY
+  - name: GITHUB_APP_KEY
+    secret: ADE_DB.SECRETS.GITHUB_APP_KEY
+
+# Egress to api.github.com only, for opening and tracking pull requests.
+external_access_integrations:
+  - ADE_GITHUB_EAI
 
 ignore:
   - node_modules

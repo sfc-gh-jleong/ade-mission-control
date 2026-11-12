@@ -61,3 +61,14 @@ export const reviewSealParts = (r: {
   rehearsalOutcome: string | null
   fixHash: string
 }) => ["REVIEW", r.reviewId, r.fixId, r.verdict, r.rawConfidence.toFixed(2), r.confidence.toFixed(2), r.rehearsalOutcome, r.fixHash]
+
+/** The repo file change for a fix (OPS.SOURCE_CHANGES): what a pull request may push. */
+export const sourceSealParts = (s: { fixId: string; path: string; baseCommitSha: string; baseBlobSha: string; newBlobSha: string; patchHash: string }) => [
+  "SOURCE",
+  s.fixId,
+  s.path,
+  s.baseCommitSha,
+  s.baseBlobSha,
+  s.newBlobSha,
+  s.patchHash,
+]

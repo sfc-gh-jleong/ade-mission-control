@@ -11,6 +11,16 @@ import type { RehearsalResult } from "@/lib/server/rehearsal/engine"
 import type { FailureContext, IncidentRow } from "@/lib/server/orchestrator"
 import { iso } from "@/lib/server/db"
 
+/** The job's file when its code lives in Git (lib/server/github/source.ts). */
+export interface GitBrief {
+  repo: string
+  path: string
+  header: string
+  body: string
+  productionMatches: boolean | null
+  jobType: "TASK" | "DYNAMIC_TABLE"
+}
+
 function untrusted(label: string, value: unknown): string {
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2)
   const safe = String(text ?? "").replace(/<\/?untrusted[^>]*>/gi, "")
@@ -53,7 +63,8 @@ export function briefForInvestigator(i: IncidentRow, ctx: FailureContext): strin
   ].join("\n")
 }
 
-export function briefForFixer(i: IncidentRow, d: Diagnosis): string {
+export function briefForFixer(i: IncidentRow, d: Diagnosis, git: GitBrief | null = null): string {
+  const target = `{{DB}}.${i.JOB_FQN.split(".").slice(1).join(".")}`
   return [
     "Write a fix for this incident and submit it with submit_fix.",
     "",
@@ -75,10 +86,34 @@ export function briefForFixer(i: IncidentRow, d: Diagnosis): string {
     "Error message:",
     untrusted("error_message", i.ERROR_MESSAGE ?? ""),
     "",
-    `Write every reference to an object in ${i.DATABASE_NAME} as {{DB}}.<SCHEMA>.<OBJECT> (e.g. {{DB}}.${i.JOB_FQN.split(".").slice(1).join(".")}).`,
+    `Write every reference to an object in ${i.DATABASE_NAME} as {{DB}}.<SCHEMA>.<OBJECT> (e.g. ${target}).`,
     "Each statement is one SQL statement without a trailing semicolon and without comments.",
     "target_objects lists every object your statements create or change, as {{DB}}.<SCHEMA>.<OBJECT>.",
+    ...(git ? gitRules(git, target) : []),
   ].join("\n")
+}
+
+function gitRules(git: GitBrief, target: string): string[] {
+  const shape =
+    git.jobType === "TASK"
+      ? `ALTER TASK ${target} SUSPEND, then ALTER TASK ${target} MODIFY AS <new body>, then ALTER TASK ${target} RESUME`
+      : `one CREATE OR REPLACE DYNAMIC TABLE ${target} with TARGET_LAG, WAREHOUSE and REFRESH_MODE exactly as in the file header, AS <new query>`
+  return [
+    "",
+    `## This job's code lives in Git (${git.repo}, ${git.path})`,
+    "Your fix becomes a pull request that replaces only the body of that file. A person reviews and merges it; GitHub Actions deploys it.",
+    `- Write the fix as: ${shape}. No other statements: the header (warehouse, schedule, predecessors, condition, comment), other objects and data stay as they are.`,
+    "- Start from the current body below and change only what the fix needs. Keep its formatting and line breaks so the pull request's diff stays small.",
+    "- rollback_statements restore the current body the same way.",
+    "- If the failure is a missing object that the repo defines (for example a dropped table), submit only CREATE TABLE IF NOT EXISTS for it: ADE then asks for a deploy of main, which recreates it, instead of a pull request.",
+    ...(git.productionMatches === false ? ["- Production's definition differs from this file. The pull request is based on the file; say so in assumptions if it matters."] : []),
+    "",
+    "File header (stays unchanged):",
+    untrusted("repo_file_header", git.header),
+    "",
+    "Current body in the file ({{DB}} as written in the repo):",
+    untrusted("repo_file_body", git.body),
+  ]
 }
 
 export function revisionBrief(feedback: string): string {
@@ -90,7 +125,14 @@ export function revisionBrief(feedback: string): string {
   ].join("\n")
 }
 
-export function briefForReviewer(i: IncidentRow, d: Diagnosis, fix: FixProposal, r: RehearsalResult, iteration: number): string {
+export function briefForReviewer(
+  i: IncidentRow,
+  d: Diagnosis,
+  fix: FixProposal,
+  r: RehearsalResult,
+  iteration: number,
+  git: { repo: string; path: string; diff: string } | null = null,
+): string {
   return [
     `Review fix version ${iteration} for this incident and submit your verdict with submit_review.`,
     "",
@@ -127,5 +169,13 @@ export function briefForReviewer(i: IncidentRow, d: Diagnosis, fix: FixProposal,
     }),
     "",
     "Note: the final confidence is capped by the rehearsal outcome (FAILED <= 40, INCONCLUSIVE/UNSUPPORTED <= 70), but score your honest estimate.",
+    ...(git
+      ? [
+          "",
+          `This job's code lives in Git. If you approve, ADE opens a pull request to ${git.repo} with exactly this change to ${git.path}`,
+          "(the rehearsed body, copied into the file; a person reviews and merges it, and GitHub Actions deploys it). Review the diff as part of the fix:",
+          untrusted("pull_request_diff", git.diff),
+        ]
+      : []),
   ].join("\n")
 }

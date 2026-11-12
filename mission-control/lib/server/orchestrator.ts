@@ -7,6 +7,9 @@
  *          REVISE / rehearsal FAILED  -> FIXING again (max N iterations)
  *          REJECT                     -> NEEDS_HUMAN
  *          APPROVE                    -> AWAITING_APPROVAL (human, via GUARD)
+ *                                        or, when the job's code lives in Git,
+ *                                        PR_OPEN -> DEPLOYING -> VERIFYING
+ *                                        (lib/server/github/, read-only tracking)
  *   APPLY and ROLLBACK are human actions (lib/server/actions.ts + GUARD procs).
  *   VERIFYING -> RESOLVED when the job's next run succeeds (verifier below).
  *
@@ -28,8 +31,14 @@ import { screenRollback, screenStatements } from "@/lib/server/agents/sql-guard"
 import { rehearse, saveRehearsal, sweepSandboxes, type RehearsalResult } from "@/lib/server/rehearsal/engine"
 import { Step, savePayload, systemStep } from "@/lib/server/telemetry"
 import { seal, fixSealParts, reviewSealParts } from "@/lib/server/seal"
-import { briefForFixer, briefForInvestigator, briefForReviewer, revisionBrief } from "@/lib/server/agents/prompts"
+import { briefForFixer, briefForInvestigator, briefForReviewer, revisionBrief, type GitBrief } from "@/lib/server/agents/prompts"
 import { capConfidence, type AgentRole } from "@/lib/domain"
+import { githubConfigured } from "@/lib/server/github/client"
+import { buildChange, classifyGitFix } from "@/lib/server/github/files"
+import { openPullRequest } from "@/lib/server/github/pr"
+import { gitTarget, pinSource, saveChange, type PinnedSource } from "@/lib/server/github/source"
+import { branchName } from "@/lib/server/github/text"
+import { noteTracked, trackPullRequests } from "@/lib/server/github/tracker"
 
 const INSTANCE = `${os.hostname()}:${process.pid}`
 const TICK_MS = 15_000
@@ -137,6 +146,9 @@ async function tick(): Promise<void> {
   const o = g.__adeOrch!
   o.state.lastTickAt = nowIso()
   if (!agentsAllowedHere().allowed) return
+  // Pull requests and deploys are polled on their own schedule (and kept
+  // tracking when the pipeline is switched off).
+  await trackPullRequests().catch((e) => console.error(nowIso(), "[orchestrator] PR tracking failed", e))
   const bell = await doorbell()
   const due = o.wake || bell !== o.lastDoorbell || Date.now() - o.lastPoll > SAFETY_POLL_MS || o.running.size > 0
   publish({ type: "orchestrator.heartbeat", state: { ...o.state, running: o.running.size }, at: nowIso() })
@@ -308,9 +320,19 @@ async function processIncident(incident: IncidentRow, settings: Settings): Promi
     // ---------------- Fix -> Rehearse -> Review loop
     // A resumed incident's in-flight fix versions are stale; the loop writes a new one.
     await sql(
-      `UPDATE ADE_DB.OPS.FIXES SET STATUS = 'SUPERSEDED', UPDATED_AT = SYSDATE() WHERE INCIDENT_ID = ? AND STATUS IN ('PROPOSED', 'REHEARSED', 'REVIEWED')`,
+      `UPDATE ADE_DB.OPS.FIXES SET STATUS = 'SUPERSEDED', UPDATED_AT = SYSDATE()
+       WHERE INCIDENT_ID = ? AND STATUS IN ('PROPOSED', 'REHEARSED', 'REVIEWED', 'PR_PENDING', 'DEPLOY_NEEDED')`,
       [id],
     )
+    await sql(`UPDATE ADE_DB.OPS.PULL_REQUESTS SET STATE = 'CANCELLED', UPDATED_AT = SYSDATE() WHERE INCIDENT_ID = ? AND STATE IN ('PENDING', 'DEPLOY_NEEDED')`, [id])
+
+    // A job whose code lives in Git is fixed by a pull request to its file.
+    const git = await gitContext(incident)
+    if (git === "STOP") return
+    const gitBrief: GitBrief | null = git
+      ? { repo: git.repo, path: git.path, header: git.file.header, body: git.file.body, productionMatches: git.productionMatches, jobType: git.job.type }
+      : null
+
     let feedback: string | null = null
     let iteration = num(incident.FIX_ITERATIONS)
     while (iteration < settings.maxFixIterations) {
@@ -326,7 +348,7 @@ async function processIncident(incident: IncidentRow, settings: Settings): Promi
         role: "FIXER",
         phase: "FIX",
         task: iteration === 1 ? `Write a fix for ${incident.JOB_FQN}` : `Revise the fix (iteration ${iteration})`,
-        prompt: feedback ? revisionBrief(feedback) : briefForFixer(incident, diagnosis),
+        prompt: feedback ? revisionBrief(feedback) : briefForFixer(incident, diagnosis, gitBrief),
         schema: FixSchema,
         validate: (fix) => {
           if (fix.strategy === "RERUN_ONLY") return fix.statements.length ? "RERUN_ONLY fixes must have no statements" : null
@@ -334,6 +356,13 @@ async function processIncident(incident: IncidentRow, settings: Settings): Promi
           const fwd = screenStatements(fix.statements)
           const back = screenRollback(fix.rollback_statements, fix.statements)
           const errors = [...fwd.errors, ...back.errors.map((e) => `rollback ${e}`)]
+          if (git) {
+            const shape = classifyGitFix(fix.statements, git.job, git.repoDefined, git.file.header)
+            if (shape.kind === "INVALID") errors.push(shape.error)
+            else if (shape.kind === "BODY" && git.productionMatches === true && buildChange(git, shape.body).unchanged) {
+              errors.push("The new body is the repo file's current body, which production already runs, so it changes nothing. Change the body to fix the failure (or use strategy RERUN_ONLY if a rerun is enough)")
+            }
+          }
           return errors.length ? errors.join("; ") : null
         },
         threadId: fixThread,
@@ -350,11 +379,30 @@ async function processIncident(incident: IncidentRow, settings: Settings): Promi
         await setStatus(id, "NO_FIX", `Fixer recommends a plain rerun: ${fix.summary}`)
         return
       }
-      const stored = await storeFix(incident, fix, fixOut.agentRunId, iteration)
+      const stored = await storeFix(incident, fix, fixOut.agentRunId)
+
+      // Git: the rehearsed body becomes the change to the job's file (or, when
+      // main already holds the fix, a request to deploy main).
+      let gitDiff: string | null = null
+      if (git) {
+        const shape = classifyGitFix(fix.statements, git.job, git.repoDefined, git.file.header)
+        const change = shape.kind === "BODY" ? buildChange(git, shape.body) : null
+        if (shape.kind === "DEPLOY_ONLY" || change?.unchanged) {
+          const objects = shape.kind === "DEPLOY_ONLY" ? shape.objects : [`${git.job.schema}.${git.job.name}`]
+          await requestDeploy(incident, stored.fixId, git, objects, shape.kind === "DEPLOY_ONLY")
+          return
+        }
+        if (!change) {
+          await setStatus(id, "NEEDS_HUMAN", "The fix does not map to a change of the job's file in Git")
+          return
+        }
+        await saveChange(stored.fixId, id, git, change)
+        gitDiff = change.diff
+      }
 
       // Rehearse
       await setStatus(id, "REHEARSING", "Rehearsing the fix in a sandbox clone", { CURRENT_FIX_ID: stored.fixId })
-      const rehearsal = await runRehearsal(incident, stored.fixId, fix, iteration)
+      const rehearsal = await runRehearsal(incident, stored.fixId, fix, stored.version)
 
       // Review
       await setStatus(id, "REVIEWING", `Reviewer is scoring the fix (rehearsal ${rehearsal.outcome})`)
@@ -363,8 +411,8 @@ async function processIncident(incident: IncidentRow, settings: Settings): Promi
         incidentId: id,
         role: "REVIEWER",
         phase: "REVIEW",
-        task: `Review fix v${iteration} for ${incident.JOB_FQN}`,
-        prompt: briefForReviewer(incident, diagnosis, fix, rehearsal, iteration),
+        task: `Review fix v${stored.version} for ${incident.JOB_FQN}`,
+        prompt: briefForReviewer(incident, diagnosis, fix, rehearsal, stored.version, git && gitDiff ? { repo: git.repo, path: git.path, diff: gitDiff } : null),
         schema: ReviewSchema,
         threadId: reviewThread,
         iteration,
@@ -380,9 +428,13 @@ async function processIncident(incident: IncidentRow, settings: Settings): Promi
       await storeReview(stored, review, reviewOut.agentRunId, confidence, capReason, rehearsal.outcome)
 
       const verdict = rehearsal.outcome === "FAILED" && review.verdict === "APPROVE" ? "REVISE" : review.verdict
+      if (verdict === "APPROVE" && confidence >= settings.minConfidence && git) {
+        await handOffToPullRequest(incident, stored.fixId, git, stored.version, confidence, rehearsal.outcome)
+        return
+      }
       if (verdict === "APPROVE" && confidence >= settings.minConfidence) {
         await sql(`UPDATE ADE_DB.OPS.FIXES SET STATUS = 'AWAITING_APPROVAL', UPDATED_AT = SYSDATE() WHERE FIX_ID = ?`, [stored.fixId])
-        await setStatus(id, "AWAITING_APPROVAL", `Fix v${iteration} ready for approval (confidence ${confidence.toFixed(0)})`, { CONFIDENCE: confidence })
+        await setStatus(id, "AWAITING_APPROVAL", `Fix v${stored.version} ready for approval (confidence ${confidence.toFixed(0)})`, { CONFIDENCE: confidence })
         await audit(id, stored.fixId, "READY_FOR_APPROVAL", { confidence, rehearsal: rehearsal.outcome })
         return
       }
@@ -407,6 +459,78 @@ async function threadOf(incidentId: string, role: AgentRole): Promise<string | n
   const col = role === "INVESTIGATOR" ? "INVESTIGATOR_THREAD_ID" : role === "FIXER" ? "FIXER_THREAD_ID" : "REVIEWER_THREAD_ID"
   const r = await sqlOne<{ T: string | null }>(`SELECT ${col} AS T FROM ADE_DB.OPS.INCIDENTS WHERE INCIDENT_ID = ?`, [incidentId])
   return r?.T ?? null
+}
+
+// ---------------------------------------------------------------------------
+// Git delivery: the job's code lives in a GitHub repo (GUARD.MANAGED_DATABASES
+// DELIVERY = 'PULL_REQUEST'). GUARD refuses direct changes there, so an
+// approved fix becomes a pull request (lib/server/github/).
+// ---------------------------------------------------------------------------
+
+/** The job's file pinned at main's head; null if the database is fixed in place; "STOP" if a person must take over. */
+async function gitContext(incident: IncidentRow): Promise<PinnedSource | null | "STOP"> {
+  const id = incident.INCIDENT_ID
+  const stop = async (detail: string) => {
+    await setStatus(id, "NEEDS_HUMAN", detail)
+    return "STOP" as const
+  }
+  let target: Awaited<ReturnType<typeof gitTarget>>
+  try {
+    target = await gitTarget(incident.DATABASE_NAME, incident.JOB_TYPE, incident.JOB_FQN)
+  } catch (e) {
+    return stop(e instanceof Error ? e.message : String(e))
+  }
+  if (!target) return null
+  if (!target.mayEdit) return stop(`${target.path} in ${target.repo} is not one ADE may change (GUARD.REPO_OBJECTS)`)
+  const { ok, problem, settings } = await githubConfigured()
+  if (!ok) return stop(`This job's code lives in ${target.repo}, but Git delivery is not configured: ${problem}`)
+  try {
+    return await systemStep(id, "FIX", `Read ${target.path} from ${target.repo}`, async () => {
+      const p = await pinSource(target!, settings)
+      const drift = p.productionMatches === false ? "; production's definition differs from the file" : p.productionMatches === null ? "; production's definition could not be read" : ""
+      return {
+        value: p,
+        summary: `${p.path} at ${p.baseBranch} ${p.baseCommitSha.slice(0, 7)}${drift}`,
+        detail: { repo: p.repo, path: p.path, commit: p.baseCommitSha, blob: p.baseBlobSha, production_matches: p.productionMatches },
+      }
+    })
+  } catch (e) {
+    return stop(`Could not read the job's file from GitHub: ${e instanceof Error ? e.message : String(e)}`)
+  }
+}
+
+/** main already holds the fix (e.g. a dropped table it defines): deploying main is the remedy. */
+async function requestDeploy(incident: IncidentRow, fixId: string, git: PinnedSource, objects: string[], recreate: boolean): Promise<void> {
+  const id = incident.INCIDENT_ID
+  await sql(`UPDATE ADE_DB.OPS.FIXES SET STATUS = 'DEPLOY_NEEDED', UPDATED_AT = SYSDATE() WHERE FIX_ID = ?`, [fixId])
+  await sql(
+    `INSERT INTO ADE_DB.OPS.PULL_REQUESTS (FIX_ID, INCIDENT_ID, REPO, BASE_BRANCH, PATH, STATE) SELECT ?, ?, ?, ?, ?, 'DEPLOY_NEEDED'`,
+    [fixId, id, git.repo, git.baseBranch, git.path],
+  )
+  const what = recreate ? `${objects.join(", ")} ${objects.length > 1 ? "are" : "is"} defined in ${git.repo}` : `${git.path} on ${git.baseBranch} already has this code`
+  await setStatus(
+    id,
+    "NEEDS_HUMAN",
+    `${what}, so deploying ${git.baseBranch} fixes this: run the Deploy workflow in ${git.repo} (Actions, Deploy, Run workflow). ADE resolves the incident after the deploy and the job's next successful run.`,
+    { CURRENT_FIX_ID: fixId },
+  )
+  await audit(id, fixId, "DEPLOY_REQUESTED", { repo: git.repo, objects, recreate })
+  noteTracked()
+}
+
+/** Reviewer approved: hand the fix to a pull request instead of GUARD approval. */
+async function handOffToPullRequest(incident: IncidentRow, fixId: string, git: PinnedSource, version: number, confidence: number, rehearsal: string): Promise<void> {
+  const id = incident.INCIDENT_ID
+  await sql(`UPDATE ADE_DB.OPS.FIXES SET STATUS = 'PR_PENDING', UPDATED_AT = SYSDATE() WHERE FIX_ID = ?`, [fixId])
+  await sql(
+    `INSERT INTO ADE_DB.OPS.PULL_REQUESTS (FIX_ID, INCIDENT_ID, REPO, BASE_BRANCH, BRANCH, PATH, STATE, REVIEW_DRIFT) SELECT ?, ?, ?, ?, ?, ?, 'PENDING', ?`,
+    [fixId, id, git.repo, git.baseBranch, branchName(incident.INCIDENT_NUMBER, version), git.path, git.productionMatches === false ? "PRODUCTION_DIFFERS" : null],
+  )
+  await setStatus(id, "PR_OPEN", `Fix v${version} approved by the Reviewer (confidence ${confidence.toFixed(0)}); opening a pull request`, { CONFIDENCE: confidence })
+  await audit(id, fixId, "READY_FOR_PR", { confidence, rehearsal, repo: git.repo, path: git.path })
+  noteTracked()
+  const r = await openPullRequest(fixId)
+  if (r.status === "HELD") await setStatus(id, "PR_OPEN", `Fix v${version} is ready for a pull request. Waiting: ${r.reason}`)
 }
 
 async function latestDiagnosis(incidentId: string): Promise<Diagnosis | null> {
@@ -452,10 +576,13 @@ interface StoredFix {
   fixHash: string
 }
 
-async function storeFix(incident: IncidentRow, fix: FixProposal, agentRunId: string, version: number): Promise<StoredFix> {
+async function storeFix(incident: IncidentRow, fix: FixProposal, agentRunId: string): Promise<StoredFix> {
   const fixId = crypto.randomUUID()
   const statements = fix.statements.map((s) => s.trim())
   const rollback = fix.rollback_statements.map((s) => s.trim())
+  // Versions continue across re-queues (the loop's iteration count restarts).
+  const [v] = await sql<{ V: number }>(`SELECT COALESCE(MAX(VERSION), 0) + 1 AS V FROM ADE_DB.OPS.FIXES WHERE INCIDENT_ID = ?`, [incident.INCIDENT_ID])
+  const version = num(v?.V) || 1
   // The same canonical hash GUARD recomputes before approve/apply.
   const [h] = await sql<{ H: string }>(`SELECT ADE_DB.GUARD.FIX_HASH(?, PARSE_JSON(?), PARSE_JSON(?)) AS H`, [incident.DATABASE_NAME, json(statements), json(rollback)])
   const fixHash = h.H
@@ -539,11 +666,13 @@ function feedbackFor(review: Review, rehearsal: RehearsalResult, confidence: num
 // VERIFY_FAILED when it fails again.
 // ---------------------------------------------------------------------------
 async function checkVerifications(): Promise<void> {
-  const rows = await sql<{ INCIDENT_ID: string; FIX_ID: string; JOB_ID: string; APPLIED_AT: unknown; LAST_STATUS: string; LAST_RUN_AT: unknown; LAST_SUCCESS_AT: unknown; LAST_FAILURE_AT: unknown; INCIDENT_NUMBER: number }>(
-    `SELECT i.INCIDENT_ID, f.FIX_ID, i.JOB_ID, f.APPLIED_AT, j.LAST_STATUS, j.LAST_RUN_AT, j.LAST_SUCCESS_AT, j.LAST_FAILURE_AT, i.INCIDENT_NUMBER
+  const rows = await sql<{ INCIDENT_ID: string; FIX_ID: string; JOB_ID: string; APPLIED_AT: unknown; LAST_STATUS: string; LAST_RUN_AT: unknown; LAST_SUCCESS_AT: unknown; LAST_FAILURE_AT: unknown; INCIDENT_NUMBER: number; PR_NUMBER: number | null; DEPLOYED: boolean }>(
+    `SELECT i.INCIDENT_ID, f.FIX_ID, i.JOB_ID, f.APPLIED_AT, j.LAST_STATUS, j.LAST_RUN_AT, j.LAST_SUCCESS_AT, j.LAST_FAILURE_AT, i.INCIDENT_NUMBER,
+            p.PR_NUMBER, p.PR_ID IS NOT NULL AS DEPLOYED
      FROM ADE_DB.OPS.INCIDENTS i
      JOIN ADE_DB.OPS.FIXES f ON f.FIX_ID = i.CURRENT_FIX_ID
      JOIN ADE_DB.OPS.JOBS j ON j.JOB_ID = i.JOB_ID
+     LEFT JOIN ADE_DB.OPS.PULL_REQUESTS p ON p.FIX_ID = f.FIX_ID AND p.STATE = 'DEPLOYED'
      WHERE i.STATUS = 'VERIFYING' AND f.STATUS = 'APPLIED'`,
   )
   for (const r of rows) {
@@ -551,13 +680,18 @@ async function checkVerifications(): Promise<void> {
     const applied = t(r.APPLIED_AT)
     const ok = t(r.LAST_SUCCESS_AT)
     const bad = t(r.LAST_FAILURE_AT)
+    const how = r.DEPLOYED ? (r.PR_NUMBER ? `pull request #${r.PR_NUMBER} was deployed` : "the deploy") : "the fix"
     if (ok > applied && ok >= bad) {
       await sql(`UPDATE ADE_DB.OPS.FIXES SET STATUS = 'VERIFIED', UPDATED_AT = SYSDATE() WHERE FIX_ID = ?`, [r.FIX_ID])
-      await setStatus(r.INCIDENT_ID, "RESOLVED", "Verified: the job succeeded after the fix")
+      await setStatus(r.INCIDENT_ID, "RESOLVED", `Verified: the job succeeded after ${how}`)
       await audit(r.INCIDENT_ID, r.FIX_ID, "VERIFIED", { last_success_at: r.LAST_SUCCESS_AT })
     } else if (bad > applied) {
       await sql(`UPDATE ADE_DB.OPS.FIXES SET STATUS = 'VERIFY_FAILED', UPDATED_AT = SYSDATE() WHERE FIX_ID = ?`, [r.FIX_ID])
-      await setStatus(r.INCIDENT_ID, "NEEDS_HUMAN", "The job failed again after the fix; consider rolling back")
+      await setStatus(
+        r.INCIDENT_ID,
+        "NEEDS_HUMAN",
+        r.DEPLOYED ? `The job failed again after ${how}. Revert it on GitHub, or queue the incident again.` : "The job failed again after the fix; consider rolling back",
+      )
       await audit(r.INCIDENT_ID, r.FIX_ID, "VERIFY_FAILED", { last_failure_at: r.LAST_FAILURE_AT })
     }
   }

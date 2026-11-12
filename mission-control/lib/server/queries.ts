@@ -4,6 +4,7 @@
  */
 import { iso, num, parseVariant, sql, sqlOne } from "@/lib/server/db"
 import { verify, fixSealParts, reviewSealParts, type SealState } from "@/lib/server/seal"
+import { deliveryFor, loadChange } from "@/lib/server/github/source"
 
 export interface IncidentListItem {
   id: string
@@ -70,10 +71,10 @@ export async function listIncidents(filter: { view?: string; q?: string; limit?:
   const binds: (string | number)[] = []
   switch (filter.view) {
     case "active":
-      where.push(`STATUS IN ('QUEUED', 'INVESTIGATING', 'FIXING', 'REHEARSING', 'REVIEWING', 'APPLYING', 'VERIFYING')`)
+      where.push(`STATUS IN ('QUEUED', 'INVESTIGATING', 'FIXING', 'REHEARSING', 'REVIEWING', 'APPLYING', 'DEPLOYING', 'VERIFYING')`)
       break
     case "attention":
-      where.push(`STATUS IN ('AWAITING_APPROVAL', 'APPROVED', 'NEEDS_HUMAN')`)
+      where.push(`STATUS IN ('AWAITING_APPROVAL', 'APPROVED', 'PR_OPEN', 'NEEDS_HUMAN')`)
       break
     case "open":
       where.push(`STATUS NOT IN ('RESOLVED', 'NO_FIX', 'SUPPRESSED', 'SYMPTOM')`)
@@ -105,7 +106,7 @@ export async function getIncident(id: string) {
   const r = await sqlOne(`SELECT ${INCIDENT_COLS} FROM ADE_DB.OPS.INCIDENTS WHERE INCIDENT_ID = ? OR TO_VARCHAR(INCIDENT_NUMBER) = ?`, [id, id.replace(/^ADE-/i, "")])
   if (!r) return null
   const incidentId = String(r.INCIDENT_ID)
-  const [diagnosis, fixes, reviews, rehearsals, runs, symptoms, audit, decisions, job, agentRuns] = await Promise.all([
+  const [diagnosis, fixes, reviews, rehearsals, runs, symptoms, audit, decisions, job, agentRuns, delivery, pullRequests] = await Promise.all([
     sqlOne(`SELECT * FROM ADE_DB.OPS.DIAGNOSES WHERE INCIDENT_ID = ? ORDER BY CREATED_AT DESC LIMIT 1`, [incidentId]),
     sql(`SELECT * FROM ADE_DB.OPS.FIXES WHERE INCIDENT_ID = ? ORDER BY VERSION DESC`, [incidentId]),
     sql(`SELECT * FROM ADE_DB.OPS.REVIEWS WHERE INCIDENT_ID = ? ORDER BY CREATED_AT DESC`, [incidentId]),
@@ -120,7 +121,12 @@ export async function getIncident(id: string) {
     sql(`SELECT FIX_ID, DECISION, FIX_HASH, DECIDED_BY, COMMENT, DECIDED_AT FROM ADE_DB.GUARD.DECISIONS WHERE INCIDENT_ID = ? ORDER BY DECIDED_AT DESC`, [incidentId]),
     sqlOne(`SELECT FQN, JOB_TYPE, OWNER_ROLE, WAREHOUSE, SCHEDULE, STATE, PREDECESSORS, DEFINITION, LAST_SUCCESS_AT, LAST_FAILURE_AT, RUNS_24H, FAILURES_24H FROM ADE_DB.OPS.JOBS WHERE JOB_ID = ?`, [String(r.JOB_ID)]),
     sql(`SELECT * FROM ADE_DB.OPS.AGENT_RUNS WHERE INCIDENT_ID = ? ORDER BY STARTED_AT`, [incidentId]),
+    deliveryFor(String(r.DATABASE_NAME)).catch(() => ({ delivery: "APPLY" as const, repo: null })),
+    sql(`SELECT * FROM ADE_DB.OPS.PULL_REQUESTS WHERE INCIDENT_ID = ? ORDER BY CREATED_AT DESC`, [incidentId]).catch(() => []),
   ])
+  const changes = new Map(
+    (await Promise.all(fixes.map((f) => loadChange(String(f.FIX_ID)).catch(() => null)))).filter((c) => c !== null).map((c) => [c!.fixId, c!]),
+  )
   const latestApproval = new Map<string, { decision: string; hash: string }>()
   for (const d of decisions) {
     const fixId = String(d.FIX_ID)
@@ -149,6 +155,9 @@ export async function getIncident(id: string) {
         appliedBy: f.APPLIED_BY, appliedAt: iso(f.APPLIED_AT), applyError: f.APPLY_ERROR, appliedStatements: parseVariant(f.APPLIED_STATEMENTS),
         snapshot: parseVariant(f.SNAPSHOT_DDL), rolledBackAt: iso(f.ROLLED_BACK_AT), createdAt: iso(f.CREATED_AT), seal: sealState,
         guardDecision: latestApproval.get(fixId) ?? null,
+        sourceChange: changes.has(fixId)
+          ? (({ path, repo, baseBranch, baseCommitSha, diff, seal }) => ({ path, repo, baseBranch, baseCommitSha, diff, seal }))(changes.get(fixId)!)
+          : null,
       }
     }),
     reviews: reviews.map((v) => {
@@ -181,6 +190,15 @@ export async function getIncident(id: string) {
       inputTokens: num(a.INPUT_TOKENS), outputTokens: num(a.OUTPUT_TOKENS), cacheRead: num(a.CACHE_READ_TOKENS), cacheWrite: num(a.CACHE_WRITE_TOKENS),
       uncached: num(a.UNCACHED_INPUT_TOKENS), credits: a.CREDITS === null ? null : num(a.CREDITS), threadId: a.THREAD_ID, requestId: a.REQUEST_ID,
       error: a.ERROR_MESSAGE, specHash: a.AGENT_SPEC_HASH,
+    })),
+    delivery: { mode: delivery.delivery, repo: delivery.repo },
+    pullRequests: pullRequests.map((p) => ({
+      id: p.PR_ID, fixId: p.FIX_ID, repo: p.REPO, baseBranch: p.BASE_BRANCH, branch: p.BRANCH, path: p.PATH, state: p.STATE,
+      number: p.PR_NUMBER === null ? null : num(p.PR_NUMBER), url: p.PR_URL, headSha: p.HEAD_SHA, currentHeadSha: p.CURRENT_HEAD_SHA,
+      approvals: num(p.APPROVALS), approvedBy: parseVariant<string[]>(p.APPROVED_BY) ?? [], changesRequested: Boolean(p.CHANGES_REQUESTED),
+      mergedBy: p.MERGED_BY, mergedAt: iso(p.MERGED_AT), mergeCommitSha: p.MERGE_COMMIT_SHA, closedAt: iso(p.CLOSED_AT),
+      deployCommitSha: p.DEPLOY_COMMIT_SHA, deployedAt: iso(p.DEPLOYED_AT), deployRunUrl: p.DEPLOY_RUN_URL, pipelineStatus: p.PIPELINE_STATUS,
+      drift: p.REVIEW_DRIFT, lastError: p.LAST_ERROR, lastSyncedAt: iso(p.LAST_SYNCED_AT), createdAt: iso(p.CREATED_AT),
     })),
   }
 }
@@ -241,8 +259,8 @@ export async function overview() {
     sqlOne(
       `SELECT
          COUNT_IF(STATUS NOT IN ('RESOLVED','NO_FIX','SUPPRESSED','SYMPTOM') AND NOT (STATUS = 'DETECTED' AND IS_BACKFILL)) AS OPEN,
-         COUNT_IF(STATUS IN ('QUEUED','INVESTIGATING','FIXING','REHEARSING','REVIEWING','APPLYING','VERIFYING')) AS ACTIVE,
-         COUNT_IF(STATUS IN ('AWAITING_APPROVAL','APPROVED')) AS AWAITING,
+         COUNT_IF(STATUS IN ('QUEUED','INVESTIGATING','FIXING','REHEARSING','REVIEWING','APPLYING','DEPLOYING','VERIFYING')) AS ACTIVE,
+         COUNT_IF(STATUS IN ('AWAITING_APPROVAL','APPROVED','PR_OPEN')) AS AWAITING,
          COUNT_IF(STATUS = 'NEEDS_HUMAN') AS NEEDS_HUMAN,
          COUNT_IF(STATUS = 'DETECTED' AND IS_BACKFILL) AS BACKLOG,
          COUNT_IF(STATUS = 'RESOLVED' AND RESOLVED_AT > DATEADD(day, -7, SYSDATE())) AS RESOLVED_7D,

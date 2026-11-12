@@ -36,6 +36,9 @@ export type Fixability = (typeof FIXABILITY)[number]
  *
  *   DETECTED -> INVESTIGATING -> FIXING -> REHEARSING -> REVIEWING
  *            -> AWAITING_APPROVAL -> APPLYING -> VERIFYING -> RESOLVED
+ * When the job's code lives in Git, an approved fix becomes a pull request:
+ *            -> PR_OPEN (a person reviews and merges on GitHub)
+ *            -> DEPLOYING (GitHub Actions) -> VERIFYING -> RESOLVED
  * Side exits: NEEDS_HUMAN, NO_FIX (transient/external), FAILED, SUPPRESSED,
  * and SYMPTOM (a cascade child pointing at its root incident).
  */
@@ -48,7 +51,9 @@ export const INCIDENT_STATUSES = [
   "REVIEWING",
   "AWAITING_APPROVAL",
   "APPROVED",
+  "PR_OPEN",
   "APPLYING",
+  "DEPLOYING",
   "VERIFYING",
   "RESOLVED",
   "NEEDS_HUMAN",
@@ -64,7 +69,16 @@ export const ACTIVE_STATUSES: readonly IncidentStatus[] = ["INVESTIGATING", "FIX
 /** Statuses that need no further work from the pipeline. */
 export const TERMINAL_STATUSES: readonly IncidentStatus[] = ["RESOLVED", "NO_FIX", "FAILED", "SUPPRESSED", "SYMPTOM"]
 /** Statuses that are waiting on a person. */
-export const HUMAN_STATUSES: readonly IncidentStatus[] = ["AWAITING_APPROVAL", "NEEDS_HUMAN"]
+export const HUMAN_STATUSES: readonly IncidentStatus[] = ["AWAITING_APPROVAL", "PR_OPEN", "NEEDS_HUMAN"]
+/** Statuses that are waiting on a system outside Mission Control (GitHub Actions). */
+export const EXTERNAL_STATUSES: readonly IncidentStatus[] = ["DEPLOYING"]
+
+/**
+ * Fix statuses for Git delivery: PR_PENDING (approved, PR not opened yet),
+ * PR_OPEN, MERGED, PR_CLOSED, DEPLOY_NEEDED (main already holds the fix);
+ * then APPLIED (deployed), VERIFIED or VERIFY_FAILED as for GUARD fixes.
+ */
+export const GIT_FIX_STATUSES = ["PR_PENDING", "PR_OPEN", "MERGED", "PR_CLOSED", "DEPLOY_NEEDED"] as const
 
 export const PIPELINE_STAGES = [
   { key: "DETECT", label: "Detect", actor: "SYSTEM" },
@@ -94,8 +108,10 @@ export function stageIndexForStatus(status: IncidentStatus): number {
       return 4
     case "AWAITING_APPROVAL":
     case "APPROVED":
+    case "PR_OPEN":
       return 5
     case "APPLYING":
+    case "DEPLOYING":
       return 6
     case "VERIFYING":
     case "RESOLVED":
